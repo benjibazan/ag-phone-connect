@@ -1,0 +1,17 @@
+{
+    "name": "Antigravity Phone Connect",
+    "short_name": "AG Connect",
+    "description": "Monitor and control your Antigravity AI sessions from your phone",
+    "start_url": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0f172a",
+    "theme_color": "#0f172a",
+    "icons": [
+        {
+            "src": "/icon-512.svg",
+            "sizes": "any",
+            "type": "image/svg+xml"
+        }
+    ]
+}

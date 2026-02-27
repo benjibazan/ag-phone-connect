@@ -148,23 +148,34 @@ Since macOS requires Automator for context menu entries, follow these steps manu
 
 ## ✨ Features
 
-- **🧹 Clean Mobile View (NEW!)**: Automatically filters out "Review Changes" bars, "Linked Objects," and Desktop-specific input areas to keep your phone view focused purely on the chat and code content.
-- **📜 Smart Chat History (NEW!)**: Full-screen history management with intelligent scraping. Switch between conversations, see timestamps, and manage multiple sessions directly from mobile.
-- **➕ One-Tap New Chat (NEW!)**: Start a fresh conversation instantly from your phone without needing to touch your desktop.
-- **🖼️ Context Menu Icons (NEW!)**: Visual icons in the right-click menu for better navigation.
-- **🌍 Global Web Access**: Secure remote access via ngrok tunnel. Access your AI from mobile data with passcode protection.
-- **🛡️ Auto-Cleanup**: Launchers now automatically sweep away "ghost" processes from previous sessions for a clean start every time.
+- **🪟 Multi-Window Support (NEW!)**: Switch between multiple Antigravity windows directly from your phone. The Agent Manager appears first, followed by your projects as browser-like tabs. Long-press to reorder.
+- **📂 Workspace Opener (NEW!)**: Open new project folders from your phone! When the Manager tab is active, see all your project folders as tappable tiles. Already-open projects show ✅.
+- **⚡ Workflow Launcher (NEW!)**: Access all your `/workflows` (like `/fix-bug`, `/deploy`, `/build`) from a single tap. Inserts the command into the chat input so you can add context before sending.
+- **💬 Per-Project Tabs (NEW!)**: Conversation tabs are stored per window — switching projects loads only that project's conversations.
+- **🧹 Clean Mobile View**: Automatically filters out Desktop-specific UI elements to keep your phone view focused on chat and code.
+- **📜 Smart Chat History**: Full-screen history management with intelligent scraping. Switch between conversations directly from mobile.
+- **➕ One-Tap New Chat**: Start a fresh conversation instantly from your phone.
+- **🌍 Global Web Access**: Secure remote access via ngrok tunnel with passcode protection.
 - **🔒 HTTPS Support**: Secure connections with self-signed SSL certificates.
-- **Real-Time Mirroring**: 1-second polling interval for near-instant sync.
-- **Remote Control**: Send messages, stop generations, and switch Modes (Fast/Planning) or Models (Gemini/Claude/GPT) directly from your phone.
-- **Scroll Sync**: When you scroll on your phone, the desktop Antigravity scrolls too!
-- **Thought Expansion**: Tap on "Thinking..." or "Thought" blocks on your phone to remotely expand/collapse them.
-- **Smart Sync**: Bi-directional synchronization ensures your phone always shows the current Model and Mode selected on your desktop.
-- **Premium Mobile UI**: A sleek, dark-themed interface optimized for touch interaction.
-- **Context Menu Management**: Dedicated scripts to **Install, Remove, Restart, or Backup** your Right-Click integrations.
-- **Health Monitoring**: Built-in `/health` endpoint for server status checks.
-- **Graceful Shutdown**: Clean exit on Ctrl+C, closing all connections properly.
-- **Zero-Config**: The launch scripts handle the heavy lifting of environment setup.
+- **Real-Time Mirroring**: 1-second polling for near-instant sync.
+- **Remote Control**: Send messages, stop generations, switch Modes/Models from your phone.
+- **Scroll Sync**: Phone scrolling syncs to desktop Antigravity.
+- **Thought Expansion**: Tap "Thinking..." blocks on your phone to expand/collapse them remotely.
+- **Premium Mobile UI**: Sleek, dark-themed interface optimized for touch.
+- **Health Monitoring**: Built-in `/health` endpoint for status checks.
+- **Graceful Shutdown**: Clean exit on Ctrl+C.
+
+---
+
+## ⚙️ Cross-Platform Configuration
+
+The app auto-detects paths per OS, but you can override via `.env`:
+
+| Variable | Windows (default) | macOS (default) | Linux (default) |
+|---|---|---|---|
+| `AG_BIN_PATH` | `%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd` | `/Applications/Antigravity.app/.../bin/antigravity` | `antigravity` (PATH) |
+| `PROJECTS_DIR` | `C:\Proyects` | `~/Projects` | `~/Projects` |
+
 
 ---
 
