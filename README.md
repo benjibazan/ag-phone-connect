@@ -2,194 +2,308 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-**Antigravity Phone Connect** is a high-performance, real-time mobile monitor and remote control for your Antigravity AI sessions. It allows you to step away from your desk while keeping full sight and control over your AI's thinking process and generations.
+**Antigravity Phone Connect** is a real-time mobile monitor and remote control for your [Antigravity](https://antigravity.google) AI sessions. Step away from your desk while keeping full sight and control of your AI's thinking and code generation — directly from your phone.
 
-![Antigravity Phone Connect](./assets/global_access_hero_2.png)
+> **Note:** This project is a refined fork/extension based on the original [Antigravity Shit-Chat](https://github.com/gherghett/Antigravity-Shit-Chat) by gherghett.
 
-**Note:** This project is a refined fork/extension based on the original [Antigravity Shit-Chat](https://github.com/gherghett/Antigravity-Shit-Chat) by gherghett.
+---
+
+## � Prerequisites
+
+| Requirement | Version | Notes |
+|---|---|---|
+| **Node.js** | >= 16.0 | [Download](https://nodejs.org/) |
+| **Python** | >= 3.6 | Only for launcher scripts |
+| **Antigravity** | Latest | Must be installed on the machine |
 
 ---
 
 ## 🚀 Quick Start
 
-> 💡 **Tip:** While we recommend starting Antigravity first, the server is now smart enough to wait and automatically connect whenever Antigravity becomes available!
+### Step 1: Clone & Install
 
-### Step 1: Launch Antigravity in Debug Mode
+```bash
+git clone https://github.com/benjibazan/antigravity-phone-connect.git
+cd antigravity-phone-connect
+npm install
+```
 
-Start Antigravity with the remote debugging port enabled:
+### Step 2: Configure Environment
 
-**Option A: Using Right-Click Context Menu (Recommended)**
-- Run `install_context_menu.bat` (Windows) or `./install_context_menu.sh` (Linux) and select **[1] Install**
-- Then right-click any project folder → **"Open with Antigravity (Debug)"** (now with visual icons!)
+```bash
+# Create .env from template (auto-created by launcher scripts too)
+cp .env.example .env    # Mac/Linux
+copy .env.example .env  # Windows
+```
 
-**Option B: Manual Command**
+Edit `.env` with your settings:
+
+```env
+# Required
+APP_PASSWORD=your-secure-password
+
+# Optional — for remote access via ngrok
+NGROK_AUTHTOKEN=your-ngrok-authtoken
+
+# Optional — auto-detected per OS if not set
+# AG_BIN_PATH=/path/to/antigravity
+# PROJECTS_DIR=/path/to/your/projects
+```
+
+### Step 3: Launch Antigravity in Debug Mode
+
+The **key requirement**: Antigravity must be started with `--remote-debugging-port=9000` so the phone app can connect via Chrome DevTools Protocol (CDP).
+
+**Windows — Option A: Using the debug bat script**
+```cmd
+antigravity-debug.bat C:\Proyects\my-project
+```
+
+**Windows — Option B: Right-click context menu**
+```cmd
+:: Run once to install the right-click menu entry
+install_debug_contextmenu.bat
+```
+Then right-click any folder → **"Open with Antigravity (Debug)"**
+
+**Windows — Option C: Manual**
+```cmd
+"C:\Users\<user>\AppData\Local\Programs\Antigravity\bin\antigravity.cmd" . --remote-debugging-port=9000
+```
+
+**macOS:**
+```bash
+antigravity . --remote-debugging-port=9000
+# Or if not in PATH:
+/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity . --remote-debugging-port=9000
+```
+
+**Linux:**
 ```bash
 antigravity . --remote-debugging-port=9000
 ```
 
-### Step 2: Open or Start a Chat
+> 💡 **All windows share port 9000.** Once the first Antigravity window is launched with the flag, all subsequent windows opened from within Antigravity are automatically discoverable.
 
-- In Antigravity, open an **existing chat** from the bottom-right panel, **OR**
-- Start a **new chat** by typing a message
+### Step 4: Start the Server
 
-> 💡 The server needs an active chat session to capture snapshots. Without this, you'll see "chat container not found" errors.
-
-### Step 3: Run the Server
-
-**Windows:**
-```
-Double-click start_ag_phone_connect.bat
-```
-
-**macOS / Linux:**
+**Quick (direct Node.js):**
 ```bash
-chmod +x start_ag_phone_connect.sh   # First time only
-./start_ag_phone_connect.sh
+node server.js
 ```
 
-The script will:
-- Verify Node.js and Python dependencies
-- Auto-kill any existing server on port 3000
-- **Wait for Antigravity** if it's not started yet
-- Display a **QR Code** and your **Link** (e.g., `https://192.168.1.5:3000`)
-- Provide numbered steps for easy connection
+**With launcher script (recommended — handles env setup, dependency checks, QR code):**
 
-### Step 4: Connect Your Phone (Local Wi-Fi)
+| OS | Local | Remote (ngrok) |
+|---|---|---|
+| Windows | `start_ag_phone_connect.bat` | `start_ag_phone_connect_web.bat` |
+| macOS/Linux | `./start_ag_phone_connect.sh` | `./start_ag_phone_connect_web.sh` |
 
-1. Ensure your phone is on the **same Wi-Fi network** as your PC
-2. Open your mobile browser and enter the **URL shown in the terminal**
-3. If using HTTPS: Accept the self-signed certificate warning on first visit
+The server will:
+- 🔍 Auto-discover all Antigravity windows on port 9000
+- 🔌 Connect to each via CDP WebSocket
+- 📸 Start capturing snapshots
+- 🚀 Start HTTPS server on port 3000
+- 📱 Display your connection URL and QR code
 
----
+### Step 5: Connect Your Phone
 
-## 🌍 NEW: Global Remote Access (Web Mode)
-
-Access your Antigravity session from **anywhere in the world** (Mobile Data, outside Wi-Fi) with secure passcode protection.
-
-### Setup (First Time)
-1. **Get an ngrok Token**: Sign up for free at [ngrok.com](https://ngrok.com) and get your "Authtoken".
-2. **Automatic Configuration (Recommended)**: Simply run any launcher script. They will detect if `.env` is missing and automatically create it using `.env.example` as a template.
-3. **Manual Setup**: Alternatively, copy `.env.example` to `.env` manually and update the values:
-   ```bash
-   copy .env.example .env   # Windows
-   cp .env.example .env     # Mac/Linux
-   ```
-   Update the `.env` file with your details:
-   ```env
-   NGROK_AUTHTOKEN=your_token_here
-   APP_PASSWORD=your_secure_passcode
-   XXX_API_KEY=your-ai-provider-key
-   PORT=3000
-   ```
-
-### Usage
-- **Windows**: Run `start_ag_phone_connect_web.bat`
-- **Mac/Linux**: Run `./start_ag_phone_connect_web.sh`
-
-The script will launch the server and provide a **Public URL** (e.g., `https://abcd-123.ngrok-free.app`). 
-
-**Two Ways to Connect:**
-1. **Magic Link (Easiest)**: Scan the **Magic QR Code** displayed in the terminal. It logs you in automatically!
-2. **Manual**: 
-   - Open the URL on your phone.
-   - Enter your `APP_PASSWORD` to log in.
-
-> 💡 **Tip:** Devices on the same local Wi-Fi still enjoy direct access without needing a password.
+1. Ensure your phone is on the **same Wi-Fi** as your computer
+2. Open your mobile browser → **`https://<your-ip>:3000`** (shown in terminal)
+3. Accept the self-signed certificate warning (first time only)
+4. Enter your `APP_PASSWORD` if prompted
 
 ---
 
-## 🔒 Enabling HTTPS (Recommended)
+## 🪟 Multi-Window Support
 
-For a secure connection without the browser warning icon:
+Switch between multiple Antigravity projects directly from your phone:
+
+- **Window Tabs**: Browser-like tabs at the top. **⚡ Manager** is always first, followed by projects alphabetically
+- **Long-press to Reorder**: Hold a project tab → menu appears with ⬅️ / ⬆️ First / ➡️ options. Order is saved
+- **Per-Project Conversations**: Each window stores its own chat tabs separately
+
+### Workspace Opener (Manager View)
+
+When the **⚡ Manager** tab is active, the chat input is replaced with a workspace management panel:
+
+- **Project Tiles**: 2-column grid showing all folders in your `PROJECTS_DIR`. Already-open projects marked ✅
+- **Quick Input**: Type just a folder name (e.g., `my-project`) and it auto-prepends your `PROJECTS_DIR` path
+- **One-Tap Open**: Tap any tile to open a new Antigravity window with debug port enabled
+
+### Workflow Launcher
+
+- Tap **⚡ Workflows** in the quick actions bar
+- Shows all `.agent/workflows/*.md` files as tappable chips
+- Tapping a workflow (e.g., `/fix-bug`) **inserts** it into the chat input — doesn't auto-send, so you can add context
+
+---
+
+## 🔒 HTTPS Setup
 
 ### Option 1: Command Line
 ```bash
 node generate_ssl.js
 ```
-- Uses **OpenSSL** if available (includes your IP in certificate)
-- Falls back to **Node.js crypto** if OpenSSL not found
-- Creates certificates in `./certs/` directory
 
 ### Option 2: Web UI
-1. Start the server on HTTP
-2. Look for the yellow **"⚠️ Not Secure"** banner
-3. Click **"Enable HTTPS"** button
-4. Restart the server when prompted
+1. Start the server (HTTP)
+2. Click the **"Enable HTTPS"** banner
+3. Restart the server
 
-### After Generating:
-1. **Restart the server** - it will automatically detect and use HTTPS.
-2. **On your phone's first visit**:
-   - You'll see a security warning (normal for self-signed certs).
-   - Tap **"Advanced"** → **"Proceed to site"**.
-   - The warning won't appear again!
+After generating, first visit on phone → tap **"Advanced" → "Proceed to site"** (one-time).
 
 ---
 
-### macOS: Adding Right-Click "Quick Action" (Optional)
+## 🌍 Remote Access (ngrok)
 
-Since macOS requires Automator for context menu entries, follow these steps manually:
+Access your Antigravity from **anywhere** (mobile data, outside Wi-Fi):
 
-1.  Open **Automator** (Spotlight → type "Automator").
-2.  Click **File → New** and select **Quick Action**.
-3.  At the top, set:
-    - "Workflow receives current" → **folders**
-    - "in" → **Finder**
-4.  In the left sidebar, search for **"Run Shell Script"** and drag it to the right pane.
-5.  Set "Shell" to `/bin/zsh` and "Pass input" to **as arguments**.
-6.  Paste this script:
-    ```bash
-    cd "$1"
-    antigravity . --remote-debugging-port=9000
-    ```
-7.  **Save** the Quick Action with a name like `Open with Antigravity (Debug)`.
-8.  Now you can right-click any folder in Finder → **Quick Actions → Open with Antigravity (Debug)**.
-
----
-
-## ✨ Features
-
-- **🪟 Multi-Window Support (NEW!)**: Switch between multiple Antigravity windows directly from your phone. The Agent Manager appears first, followed by your projects as browser-like tabs. Long-press to reorder.
-- **📂 Workspace Opener (NEW!)**: Open new project folders from your phone! When the Manager tab is active, see all your project folders as tappable tiles. Already-open projects show ✅.
-- **⚡ Workflow Launcher (NEW!)**: Access all your `/workflows` (like `/fix-bug`, `/deploy`, `/build`) from a single tap. Inserts the command into the chat input so you can add context before sending.
-- **💬 Per-Project Tabs (NEW!)**: Conversation tabs are stored per window — switching projects loads only that project's conversations.
-- **🧹 Clean Mobile View**: Automatically filters out Desktop-specific UI elements to keep your phone view focused on chat and code.
-- **📜 Smart Chat History**: Full-screen history management with intelligent scraping. Switch between conversations directly from mobile.
-- **➕ One-Tap New Chat**: Start a fresh conversation instantly from your phone.
-- **🌍 Global Web Access**: Secure remote access via ngrok tunnel with passcode protection.
-- **🔒 HTTPS Support**: Secure connections with self-signed SSL certificates.
-- **Real-Time Mirroring**: 1-second polling for near-instant sync.
-- **Remote Control**: Send messages, stop generations, switch Modes/Models from your phone.
-- **Scroll Sync**: Phone scrolling syncs to desktop Antigravity.
-- **Thought Expansion**: Tap "Thinking..." blocks on your phone to expand/collapse them remotely.
-- **Premium Mobile UI**: Sleek, dark-themed interface optimized for touch.
-- **Health Monitoring**: Built-in `/health` endpoint for status checks.
-- **Graceful Shutdown**: Clean exit on Ctrl+C.
+1. Sign up at [ngrok.com](https://ngrok.com) and get your authtoken
+2. Add to `.env`:
+   ```env
+   NGROK_AUTHTOKEN=your-token
+   APP_PASSWORD=your-secure-password
+   ```
+3. Run the web launcher:
+   ```bash
+   # Windows
+   start_ag_phone_connect_web.bat
+   
+   # macOS/Linux
+   ./start_ag_phone_connect_web.sh
+   ```
+4. Scan the **Magic QR Code** or open the public URL on your phone
 
 ---
 
 ## ⚙️ Cross-Platform Configuration
 
-The app auto-detects paths per OS, but you can override via `.env`:
+The app auto-detects paths per OS. Override via `.env` if needed:
 
 | Variable | Windows (default) | macOS (default) | Linux (default) |
 |---|---|---|---|
 | `AG_BIN_PATH` | `%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd` | `/Applications/Antigravity.app/.../bin/antigravity` | `antigravity` (PATH) |
 | `PROJECTS_DIR` | `C:\Proyects` | `~/Projects` | `~/Projects` |
+| `PORT` | `3000` | `3000` | `3000` |
 
+### macOS: Right-Click Quick Action (Optional)
+
+1. Open **Automator** → **File → New → Quick Action**
+2. Set: "Workflow receives current" → **folders**, "in" → **Finder**
+3. Add **"Run Shell Script"** action, set Shell to `/bin/zsh`, Pass input **as arguments**
+4. Paste:
+   ```bash
+   cd "$1"
+   antigravity . --remote-debugging-port=9000
+   ```
+5. Save as `Open with Antigravity (Debug)`
+6. Now: right-click folder → **Quick Actions → Open with Antigravity (Debug)**
 
 ---
 
-## 📂 Documentation
+## ✨ Features
 
-For more technical details, check out:
-- [**Code Documentation**](CODE_DOCUMENTATION.md) - Architecture, Data Flow, and API.
-- [**Security Guide**](SECURITY.md) - HTTPS setup, certificate warnings, and security model.
-- [**Design Philosophy**](DESIGN_PHILOSOPHY.md) - Why it was built this way.
-- [**Contributing**](CONTRIBUTING.md) - Guidelines for developers.
+### Core
+- **Real-Time Mirroring** — 1-second polling, near-instant sync
+- **Remote Control** — Send messages, stop generations, switch Modes/Models
+- **Scroll Sync** — Phone scrolling syncs to desktop
+- **Thought Expansion** — Tap "Thinking..." blocks to expand/collapse remotely
+- **Smart Sync** — Bi-directional Model & Mode synchronization
+
+### Multi-Window (NEW)
+- **🪟 Window Switcher** — Browser-like tabs with long-press reorder
+- **📂 Workspace Opener** — Project tiles, one-tap open new windows
+- **⚡ Workflow Launcher** — All `/workflows` accessible as chips
+- **💬 Per-Project Tabs** — Conversation tabs stored per window
+
+### UI & Access
+- **Premium Mobile UI** — Dark-themed, touch-optimized
+- **🧹 Clean View** — Filters desktop-only UI elements
+- **📜 Chat History** — Full-screen history with search
+- **➕ One-Tap New Chat** — Instant new conversations
+- **🌍 Global Access** — ngrok tunnel with passcode
+- **🔒 HTTPS** — Self-signed SSL certificates
+
+---
+
+## 🏗️ Architecture
+
+```
+Phone (Safari/Chrome)
+    │
+    ├─── HTTPS ──→ Express Server (port 3000)
+    │                  │
+    │                  ├── /windows ────→ CDP Discovery (port 9000)
+    │                  ├── /switch-window → CDP WebSocket switch
+    │                  ├── /open-workspace → spawn antigravity
+    │                  ├── /list-projects → fs.readdir(PROJECTS_DIR)
+    │                  ├── /list-workflows → read .agent/workflows/
+    │                  ├── /snapshot ────→ CDP Page.captureScreenshot
+    │                  ├── /send ────────→ CDP Runtime.evaluate (input)
+    │                  ├── /scroll ──────→ CDP Runtime.evaluate (scroll)
+    │                  └── WebSocket ───→ Real-time updates
+    │
+    └─── Antigravity Windows (CDP on port 9000)
+```
+
+---
+
+## 📂 Project Structure
+
+```
+antigravity-phone-connect/
+├── server.js                         # Main server (Express + CDP + WebSocket)
+├── ui_inspector.js                   # UI element inspector
+├── launcher.py                       # Unified launcher (local/web modes)
+├── generate_ssl.js                   # SSL certificate generator
+├── package.json                      # Node.js dependencies
+├── .env.example                      # Environment template
+├── .gitignore
+├── public/
+│   ├── index.html                    # Mobile UI
+│   ├── css/style.css                 # Dark theme styles
+│   ├── js/app.js                     # Frontend logic
+│   ├── manifest.json                 # PWA manifest
+│   └── icon-512.svg                  # App icon
+├── antigravity-debug.bat             # Windows: launch with debug port
+├── install_debug_contextmenu.bat     # Windows: add right-click menu
+├── install_context_menu.bat          # Windows: general context menu
+├── install_context_menu.sh           # Linux: context menu
+├── start_ag_phone_connect.bat        # Windows: local launcher
+├── start_ag_phone_connect.sh         # macOS/Linux: local launcher
+├── start_ag_phone_connect_web.bat    # Windows: ngrok launcher
+├── start_ag_phone_connect_web.sh     # macOS/Linux: ngrok launcher
+└── certs/                            # SSL certificates (generated)
+```
+
+---
+
+## 🔧 Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| **"No Antigravity windows found"** | Ensure Antigravity is running with `--remote-debugging-port=9000` |
+| **"Snapshot capture issue"** | Open or start a chat in Antigravity — the server needs an active chat session |
+| **Can't connect from phone** | Same Wi-Fi? Try `https://` not `http://`. Accept certificate warning |
+| **Port 3000 already in use** | The server auto-kills old processes. Or manually: `npx kill-port 3000` |
+| **Workspace opener: path not found** | Set `PROJECTS_DIR` in `.env` to your actual projects folder |
+| **Open workspace does nothing** | Set `AG_BIN_PATH` in `.env` to your Antigravity binary path |
+
+---
+
+## � Additional Documentation
+
+- [Code Documentation](CODE_DOCUMENTATION.md) — Architecture, data flow, API
+- [Security Guide](SECURITY.md) — HTTPS, certificates, security model
+- [Design Philosophy](DESIGN_PHILOSOPHY.md) — Why it was built this way
+- [Contributing](CONTRIBUTING.md) — Developer guidelines
+- [Release Notes](RELEASE_NOTES.md) — Version history
 
 ---
 
 ## License
 
 Licensed under the [GNU GPL v3](LICENSE).  
-Copyright (C) 2026 **Krishna Kanth B** (@krishnakanthb13)
+Original: [Antigravity Shit-Chat](https://github.com/gherghett/Antigravity-Shit-Chat) by gherghett  
+Extended by **Benji Bazan** (@benjibazan)
