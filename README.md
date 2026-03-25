@@ -8,7 +8,7 @@
 
 ---
 
-## � Prerequisites
+## 📋 Prerequisites
 
 | Requirement | Version | Notes |
 |---|---|---|
@@ -42,8 +42,8 @@ Edit `.env` with your settings:
 # Required
 APP_PASSWORD=your-secure-password
 
-# Optional — for remote access via ngrok
-NGROK_AUTHTOKEN=your-ngrok-authtoken
+# Server Port (default: 3001)
+PORT=3001
 
 # Optional — auto-detected per OS if not set
 # AG_BIN_PATH=/path/to/antigravity
@@ -68,7 +68,7 @@ Then right-click any folder → **"Open with Antigravity (Debug)"**
 
 **Windows — Option C: Manual**
 ```cmd
-"C:\Users\<user>\AppData\Local\Programs\Antigravity\bin\antigravity.cmd" . --remote-debugging-port=9000
+"%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd" . --remote-debugging-port=9000
 ```
 
 **macOS:**
@@ -94,7 +94,7 @@ node server.js
 
 **With launcher script (recommended — handles env setup, dependency checks, QR code):**
 
-| OS | Local | Remote (ngrok) |
+| OS | Local | Remote |
 |---|---|---|
 | Windows | `start_ag_phone_connect.bat` | `start_ag_phone_connect_web.bat` |
 | macOS/Linux | `./start_ag_phone_connect.sh` | `./start_ag_phone_connect_web.sh` |
@@ -103,15 +103,23 @@ The server will:
 - 🔍 Auto-discover all Antigravity windows on port 9000
 - 🔌 Connect to each via CDP WebSocket
 - 📸 Start capturing snapshots
-- 🚀 Start HTTPS server on port 3000
+- 🚀 Start HTTPS server on port 3001
+- 📱 Start HTTP fallback on port 3002 (for Tailscale)
 - 📱 Display your connection URL and QR code
 
 ### Step 5: Connect Your Phone
 
+**Option A: Same Wi-Fi (HTTPS)**
 1. Ensure your phone is on the **same Wi-Fi** as your computer
-2. Open your mobile browser → **`https://<your-ip>:3000`** (shown in terminal)
+2. Open your mobile browser → **`https://<your-ip>:3001`** (shown in terminal)
 3. Accept the self-signed certificate warning (first time only)
 4. Enter your `APP_PASSWORD` if prompted
+
+**Option B: Tailscale (recommended for remote access)**
+1. Install [Tailscale](https://tailscale.com/) on your computer and phone
+2. Connect both devices to your Tailscale network
+3. Open **`http://<tailscale-ip>:3002`** on your phone
+4. No certificate warnings — Tailscale traffic is already encrypted
 
 ---
 
@@ -155,24 +163,26 @@ After generating, first visit on phone → tap **"Advanced" → "Proceed to site
 
 ---
 
-## 🌍 Remote Access (ngrok)
+## 🌍 Remote Access
 
-Access your Antigravity from **anywhere** (mobile data, outside Wi-Fi):
+### Tailscale (Recommended)
+
+Access your Antigravity from **anywhere** — mobile data, different Wi-Fi, on the go:
+
+1. Install [Tailscale](https://tailscale.com/) on your computer and phone
+2. Both devices join the same Tailscale network (free for personal use)
+3. Start the server normally: `node server.js`
+4. Open **`http://<tailscale-ip>:3002`** on your phone
+
+> 💡 The server automatically starts an HTTP fallback on port 3002 specifically for Tailscale. Since Tailscale encrypts all traffic via WireGuard, HTTPS is redundant — so you get a clean connection without certificate warnings.
+
+### ngrok (Alternative)
+
+If you prefer ngrok for tunnel-based access:
 
 1. Sign up at [ngrok.com](https://ngrok.com) and get your authtoken
-2. Add to `.env`:
-   ```env
-   NGROK_AUTHTOKEN=your-token
-   APP_PASSWORD=your-secure-password
-   ```
-3. Run the web launcher:
-   ```bash
-   # Windows
-   start_ag_phone_connect_web.bat
-   
-   # macOS/Linux
-   ./start_ag_phone_connect_web.sh
-   ```
+2. Add `NGROK_AUTHTOKEN=your-token` to `.env`
+3. Run the web launcher: `./start_ag_phone_connect_web.sh` (or `.bat` on Windows)
 4. Scan the **Magic QR Code** or open the public URL on your phone
 
 ---
@@ -185,7 +195,7 @@ The app auto-detects paths per OS. Override via `.env` if needed:
 |---|---|---|---|
 | `AG_BIN_PATH` | `%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd` | `/Applications/Antigravity.app/.../bin/antigravity` | `antigravity` (PATH) |
 | `PROJECTS_DIR` | `C:\Proyects` | `~/Projects` | `~/Projects` |
-| `PORT` | `3000` | `3000` | `3000` |
+| `PORT` | `3001` | `3001` | `3001` |
 
 ### macOS: Right-Click Quick Action (Optional)
 
@@ -211,7 +221,7 @@ The app auto-detects paths per OS. Override via `.env` if needed:
 - **Thought Expansion** — Tap "Thinking..." blocks to expand/collapse remotely
 - **Smart Sync** — Bi-directional Model & Mode synchronization
 
-### Multi-Window (NEW)
+### Multi-Window
 - **🪟 Window Switcher** — Browser-like tabs with long-press reorder
 - **📂 Workspace Opener** — Project tiles, one-tap open new windows
 - **⚡ Workflow Launcher** — All `/workflows` accessible as chips
@@ -222,7 +232,7 @@ The app auto-detects paths per OS. Override via `.env` if needed:
 - **🧹 Clean View** — Filters desktop-only UI elements
 - **📜 Chat History** — Full-screen history with search
 - **➕ One-Tap New Chat** — Instant new conversations
-- **🌍 Global Access** — ngrok tunnel with passcode
+- **🌍 Remote Access** — Tailscale (recommended) or ngrok tunnel
 - **🔒 HTTPS** — Self-signed SSL certificates
 
 ---
@@ -232,7 +242,8 @@ The app auto-detects paths per OS. Override via `.env` if needed:
 ```
 Phone (Safari/Chrome)
     │
-    ├─── HTTPS ──→ Express Server (port 3000)
+    ├─── HTTPS (3001) ──→ Express Server
+    ├─── HTTP  (3002) ──→ (Tailscale fallback)
     │                  │
     │                  ├── /windows ────→ CDP Discovery (port 9000)
     │                  ├── /switch-window → CDP WebSocket switch
@@ -252,11 +263,12 @@ Phone (Safari/Chrome)
 ## 📂 Project Structure
 
 ```
-antigravity-phone-connect/
+ag-phone-connect/
 ├── server.js                         # Main server (Express + CDP + WebSocket)
 ├── ui_inspector.js                   # UI element inspector
 ├── launcher.py                       # Unified launcher (local/web modes)
 ├── generate_ssl.js                   # SSL certificate generator
+├── ecosystem.config.cjs              # PM2 process manager config
 ├── package.json                      # Node.js dependencies
 ├── .env.example                      # Environment template
 ├── .gitignore
@@ -272,8 +284,8 @@ antigravity-phone-connect/
 ├── install_context_menu.sh           # Linux: context menu
 ├── start_ag_phone_connect.bat        # Windows: local launcher
 ├── start_ag_phone_connect.sh         # macOS/Linux: local launcher
-├── start_ag_phone_connect_web.bat    # Windows: ngrok launcher
-├── start_ag_phone_connect_web.sh     # macOS/Linux: ngrok launcher
+├── start_ag_phone_connect_web.bat    # Windows: remote launcher
+├── start_ag_phone_connect_web.sh     # macOS/Linux: remote launcher
 └── certs/                            # SSL certificates (generated)
 ```
 
@@ -286,13 +298,14 @@ antigravity-phone-connect/
 | **"No Antigravity windows found"** | Ensure Antigravity is running with `--remote-debugging-port=9000` |
 | **"Snapshot capture issue"** | Open or start a chat in Antigravity — the server needs an active chat session |
 | **Can't connect from phone** | Same Wi-Fi? Try `https://` not `http://`. Accept certificate warning |
-| **Port 3000 already in use** | The server auto-kills old processes. Or manually: `npx kill-port 3000` |
+| **Port already in use** | The server auto-kills old processes. Or manually: `npx kill-port 3001` |
+| **Tailscale: can't connect** | Ensure both devices are on the same Tailscale network. Use `http://` on port 3002 |
 | **Workspace opener: path not found** | Set `PROJECTS_DIR` in `.env` to your actual projects folder |
 | **Open workspace does nothing** | Set `AG_BIN_PATH` in `.env` to your Antigravity binary path |
 
 ---
 
-## � Additional Documentation
+## 📚 Additional Documentation
 
 - [Code Documentation](CODE_DOCUMENTATION.md) — Architecture, data flow, API
 - [Security Guide](SECURITY.md) — HTTPS, certificates, security model
