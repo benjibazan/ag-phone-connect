@@ -277,6 +277,27 @@ async function captureSnapshot(cdp) {
         // Clone cascade to modify it without affecting the original
         const clone = cascade.cloneNode(true);
         
+        // Remove virtualization skeleton placeholders
+        // Antigravity's UI replaces off-screen turns with empty gray skeleton divs
+        // Pattern: <div style="height: Xpx;" class="rounded-lg bg-gray-500/10"></div>
+        try {
+            clone.querySelectorAll('[class*="bg-gray-500"]').forEach(el => {
+                // Only remove if it looks like a skeleton (no meaningful child content)
+                const hasContent = el.querySelector('p, li, h1, h2, h3, h4, h5, pre, code, span, a, img');
+                if (!hasContent && (el.textContent || '').trim() === '') {
+                    el.remove();
+                }
+            });
+            // Also remove parent containers that are now empty after skeleton removal
+            // These are the turn wrappers that only contained skeleton divs
+            const turnWrappers = clone.querySelectorAll('.relative.flex.flex-col.gap-y-3 > div, .flex.flex-col.gap-y-3 > div');
+            turnWrappers.forEach(wrapper => {
+                if (wrapper.children.length === 0 && (wrapper.textContent || '').trim() === '') {
+                    wrapper.remove();
+                }
+            });
+        } catch(e) {}
+        
         // Aggressively remove the entire interaction/input/review area
         try {
             // 1. Identify common interaction wrappers by class combinations
