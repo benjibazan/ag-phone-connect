@@ -8,8 +8,8 @@ echo   Antigravity Debug Mode - Context Menu Installer
 echo ===================================================
 echo.
 
-set AG_CMD=C:\Users\benji\AppData\Local\Programs\Antigravity\bin\antigravity.cmd
-set AG_ICON=C:\Users\benji\AppData\Local\Programs\Antigravity\Antigravity.exe
+set AG_CMD=%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd
+set AG_ICON=%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe
 
 :: Add to folder right-click context menu
 reg add "HKCU\Software\Classes\Directory\shell\AntigravityDebug" /ve /d "Open with Antigravity (Debug)" /f

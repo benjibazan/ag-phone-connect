@@ -5,7 +5,7 @@
 :: Example: antigravity-debug.bat C:\Proyects\juby-web
 ::          antigravity-debug.bat .
 
-set AG_PATH=C:\Users\benji\AppData\Local\Programs\Antigravity\bin\antigravity.cmd
+set AG_PATH=%LOCALAPPDATA%\Programs\Antigravity\bin\antigravity.cmd
 set DEBUG_PORT=9000
 
 if "%~1"=="" (

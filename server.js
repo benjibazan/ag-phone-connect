@@ -154,6 +154,7 @@ function extractProjectName(title) {
 // Multiple windows can share the SAME port — each is a separate page target
 async function discoverAllCDP() {
     const windows = [];
+    let managerFound = false;
     for (const port of PORTS) {
         try {
             const list = await getJson(`http://127.0.0.1:${port}/json/list`);
@@ -164,7 +165,10 @@ async function discoverAllCDP() {
                 (t.url?.includes('workbench.html') || t.title?.includes('Antigravity') || t.title === 'Launchpad')
             );
             for (const wb of workbenches) {
-                const isManager = wb.title === 'Launchpad';
+                const isManager = wb.title === 'Launchpad' || wb.title?.includes('Launchpad') || (wb.title?.includes('Manager') && !wb.title?.includes(' - '));
+                // Skip duplicate Manager windows — only keep the first one
+                if (isManager && managerFound) continue;
+                if (isManager) managerFound = true;
                 const projectName = isManager ? '⚡ Manager' : extractProjectName(wb.title);
                 const windowId = `target-${wb.id || port + '-' + projectName}`;
                 windows.push({
@@ -303,21 +307,100 @@ async function captureSnapshot(cdp) {
                 });
             });
 
-            // 2. Text-based cleanup for stray status bars
+            // 2. Text-based cleanup for stray status bars and UI chrome
             const allElements = clone.querySelectorAll('*');
             allElements.forEach(el => {
                 try {
-                    const text = (el.innerText || '').toLowerCase();
+                    const text = (el.innerText || '').trim().toLowerCase();
+                    // Remove status bars
                     if (text.includes('review changes') || text.includes('files with changes') || text.includes('context found')) {
-                        // If it's a small structural element or has buttons, it's likely a bar
                         if (el.children.length < 10 || el.querySelector('button') || el.classList?.contains('justify-between')) {
-                            el.style.display = 'none'; // Use both hide and remove
                             el.remove();
+                            return;
+                        }
+                    }
+                    // Remove Relocate/Always run buttons and small UI chrome
+                    if (text === 'relocate' || text === 'always run' || text === 'exit code' || text === 'open' || text === 'proceed') {
+                        if (el.tagName === 'BUTTON' || el.closest('button') || (el.offsetWidth < 200 && el.offsetHeight < 60)) {
+                            const target = el.closest('button') || el;
+                            target.remove();
+                            return;
                         }
                     }
                 } catch (e) {}
             });
+            
+            // 2b. Remove tooltip containers, floating UI, badges
+            const uiJunkSelectors = [
+                '[data-tooltip-id]',
+                '[role="tooltip"]',
+                '.tooltip',
+                '[class*="tooltip"]',
+                '[class*="popover"]',
+                '[class*="overlay"]',
+                '[class*="floating"]',
+                '[class*="badge"]',
+                '[class*="chip"]',
+                'button[class*="relocate" i]',
+            ];
+            uiJunkSelectors.forEach(sel => {
+                try { clone.querySelectorAll(sel).forEach(el => el.remove()); } catch(e) {}
+            });
+            
+            // 2c. Remove positioned overlays that use Tailwind-style CSS classes
+            // These are UI chrome that float on top of actual content
+            const positionedOverlaySelectors = [
+                '.absolute.top-0',
+                '.absolute.bottom-0',
+                '.absolute.right-0',
+                '.absolute.left-0',
+                '.fixed',
+                '.sticky',
+            ];
+            positionedOverlaySelectors.forEach(sel => {
+                try { 
+                    clone.querySelectorAll(sel).forEach(el => {
+                        // Only remove if it's small (likely a button/badge) or not a content container
+                        const childCount = el.querySelectorAll('p, li, h1, h2, h3, h4, h5, pre, code').length;
+                        if (childCount === 0) {
+                            el.remove();
+                        }
+                    }); 
+                } catch(e) {}
+            });
+            
+            // 2d. Remove oversized SVGs and all SVGs that aren't inline small icons
+            clone.querySelectorAll('svg').forEach(svg => {
+                try {
+                    const w = svg.getAttribute('width') || svg.style.width || '';
+                    const h = svg.getAttribute('height') || svg.style.height || '';
+                    const wNum = parseInt(w);
+                    const hNum = parseInt(h);
+                    // Remove SVGs larger than 100px or without any dimensions (will be blown up)
+                    if ((wNum > 100 || hNum > 100) || (!w && !h)) {
+                        // Keep small inline SVGs (likely icons within text)
+                        if (svg.closest('p') || svg.closest('li') || svg.closest('span')) {
+                            return; // Keep inline icons
+                        }
+                        svg.remove();
+                    }
+                } catch(e) {}
+            });
+
         } catch (globalErr) { }
+        
+        // 3. Remove any remaining contenteditable areas (input boxes with leftover text)
+        try {
+            clone.querySelectorAll('[contenteditable="true"]').forEach(el => {
+                // Walk up to find the turn/interaction container and remove it
+                let container = el;
+                for (let i = 0; i < 5; i++) {
+                    if (!container.parentElement || container.parentElement === clone) break;
+                    container = container.parentElement;
+                }
+                if (container && container !== clone) container.remove();
+            });
+        } catch (e) {}
         
         const html = clone.outerHTML;
         
@@ -410,6 +493,9 @@ async function injectMessage(cdp, text) {
         const submit = document.querySelector("svg.lucide-arrow-right")?.closest("button");
         if (submit && !submit.disabled) {
             submit.click();
+            // Clear editor text after submit to prevent it lingering in snapshots
+            await new Promise(r => setTimeout(r, 200));
+            try { editor.textContent = ''; } catch(e) {}
             return { ok:true, method:"click_submit" };
         }
 
@@ -1343,13 +1429,21 @@ function isLocalRequest(req) {
     // 2. Check the remote IP address
     const ip = req.ip || req.socket.remoteAddress || '';
 
-    // Standard local/private IPv4 and IPv6 ranges
+    // Standard local/private IPv4 and IPv6 ranges + Tailscale CGNAT (100.64.0.0/10)
+    const isTailscale = (() => {
+        const match = ip.match(/(?:^|::ffff:)(100\.(\d+)\.)/);
+        if (!match) return false;
+        const second = parseInt(match[2], 10);
+        return second >= 64 && second <= 127; // 100.64.0.0/10
+    })();
+
     return ip === '127.0.0.1' ||
         ip === '::1' ||
         ip === '::ffff:127.0.0.1' ||
         ip.startsWith('192.168.') ||
         ip.startsWith('10.') ||
         isPrivate172(ip) ||
+        isTailscale ||
         ip.startsWith('::ffff:192.168.') ||
         ip.startsWith('::ffff:10.');
 }
@@ -1394,7 +1488,11 @@ async function initCDP() {
     // Set active window: keep previous if still valid, otherwise use first
     if (!activeWindowId || !cdpWindows.has(activeWindowId) ||
         cdpWindows.get(activeWindowId).connection?.ws?.readyState !== WebSocket.OPEN) {
-        const firstValid = [...cdpWindows.entries()].find(([, w]) => w.connection?.ws?.readyState === WebSocket.OPEN);
+        // Prefer non-Manager windows (Manager has no chat DOM)
+        const nonManager = [...cdpWindows.entries()].find(([, w]) =>
+            !w.isManager && w.connection?.ws?.readyState === WebSocket.OPEN);
+        const firstValid = nonManager || [...cdpWindows.entries()].find(([, w]) =>
+            w.connection?.ws?.readyState === WebSocket.OPEN);
         if (firstValid) {
             activeWindowId = firstValid[0];
         }
@@ -1411,8 +1509,28 @@ async function initCDP() {
 async function startPolling(wss) {
     let lastErrorLog = 0;
     let isConnecting = false;
+    let consecutiveSnapshotFailures = 0;
 
     const poll = async () => {
+        // Detect stale CDP — force reconnect after consecutive failures
+        if (consecutiveSnapshotFailures >= 5 && cdpConnection && activeWindowId) {
+            console.log('🔄 CDP appears stale (5+ failures). Force-reconnecting active window...');
+            consecutiveSnapshotFailures = 0;
+            const win = cdpWindows.get(activeWindowId);
+            if (win) {
+                try {
+                    if (win.connection?.ws) try { win.connection.ws.close(); } catch (_) {}
+                    win.connection = await connectCDP(win.url);
+                    cdpWindows.set(activeWindowId, win);
+                    cdpConnection = win.connection;
+                    console.log('✅ CDP force-reconnected for:', win.projectName);
+                } catch (e) {
+                    console.log('❌ Force-reconnect failed:', e.message);
+                    cdpConnection = null;
+                }
+            }
+        }
+
         if (!cdpConnection || (cdpConnection.ws && cdpConnection.ws.readyState !== WebSocket.OPEN)) {
             if (!isConnecting) {
                 console.log('🔍 Looking for Antigravity CDP connection...');
@@ -1428,6 +1546,7 @@ async function startPolling(wss) {
                 if (cdpConnection) {
                     console.log('✅ CDP Connection established from polling loop');
                     isConnecting = false;
+                    consecutiveSnapshotFailures = 0;
                 }
             } catch (err) {
                 // Not found yet, just wait for next cycle
@@ -1437,8 +1556,18 @@ async function startPolling(wss) {
         }
 
         try {
+            const currentWindowId = activeWindowId;
             const snapshot = await captureSnapshot(cdpConnection);
+            // Discard if window switched while capturing
+            if (activeWindowId !== currentWindowId) {
+                setTimeout(poll, 200); // Quick retry with current window
+                return;
+            }
             if (snapshot && !snapshot.error) {
+                // Tag snapshot with window identity
+                snapshot.windowId = activeWindowId;
+                const activeWin = cdpWindows.get(activeWindowId);
+                snapshot.projectName = activeWin?.projectName || 'Unknown';
                 const hash = hashString(snapshot.html);
 
                 // Only update if content changed
@@ -1447,19 +1576,27 @@ async function startPolling(wss) {
                     lastSnapshotHash = hash;
 
                     // Broadcast to all connected clients
+                    // Send snapshot data directly via WebSocket (eliminates HTTP round-trip)
+                    const wsPayload = JSON.stringify({
+                        type: 'snapshot_data',
+                        html: snapshot.html,
+                        stats: snapshot.stats,
+                        windowId: activeWindowId,
+                        projectName: activeWin?.projectName || 'Unknown',
+                        timestamp: new Date().toISOString()
+                    });
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'snapshot_update',
-                                timestamp: new Date().toISOString()
-                            }));
+                            client.send(wsPayload);
                         }
                     });
 
                     console.log(`📸 Snapshot updated(hash: ${hash})`);
                 }
+                consecutiveSnapshotFailures = 0;
             } else {
                 // Snapshot is null or has error
+                consecutiveSnapshotFailures++;
                 const now = Date.now();
                 if (!lastErrorLog || now - lastErrorLog > 10000) {
                     const errorMsg = snapshot?.error || 'No valid snapshot captured (check contexts)';
@@ -1586,8 +1723,15 @@ async function createServer() {
         if (!lastSnapshot) {
             return res.status(503).json({ error: 'No snapshot available yet' });
         }
+        // Include window identity so client can detect stale data
+        const response = {
+            ...lastSnapshot,
+            windowId: activeWindowId,
+        };
+        const activeWin = cdpWindows.get(activeWindowId);
+        if (activeWin) response.projectName = activeWin.projectName;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.json(lastSnapshot);
+        res.json(response);
     });
 
     // Health check endpoint
@@ -1606,19 +1750,38 @@ async function createServer() {
         // Re-discover windows to catch newly opened ones
         try {
             const freshWindows = await discoverAllCDP();
-            // Add any newly discovered windows
+
+            // Build a set of fresh IDs for cleanup
+            const freshIds = new Set(freshWindows.map(w => w.id));
+            const freshNames = new Set(freshWindows.map(w => w.projectName));
+
+            // Remove stale windows: either no longer found by ID, or same projectName
+            // but different ID (target ID changed between discoveries)
+            for (const [id, win] of cdpWindows.entries()) {
+                if (!freshIds.has(id)) {
+                    // Window ID not found in fresh discovery — it's stale
+                    try { win.connection?.ws?.close(); } catch (e) { /* ignore */ }
+                    cdpWindows.delete(id);
+                    console.log(`🧹 Removed stale window: ${win.projectName} (${id})`);
+                }
+            }
+
+            // Also deduplicate: if a fresh window has the same projectName as an
+            // existing entry with a different ID, remove the old one first
             for (const win of freshWindows) {
                 if (!cdpWindows.has(win.id)) {
+                    // Check if there's already a window with the same projectName
+                    for (const [existingId, existingWin] of cdpWindows.entries()) {
+                        if (existingWin.projectName === win.projectName && existingId !== win.id) {
+                            try { existingWin.connection?.ws?.close(); } catch (e) { /* ignore */ }
+                            cdpWindows.delete(existingId);
+                            console.log(`🔄 Replaced duplicate window: ${win.projectName} (${existingId} → ${win.id})`);
+                        }
+                    }
                     try {
                         const conn = await connectCDP(win.url);
                         cdpWindows.set(win.id, { ...win, connection: conn });
                     } catch (e) { /* skip */ }
-                }
-            }
-            // Remove windows that are no longer available
-            for (const [id, win] of cdpWindows.entries()) {
-                if (!freshWindows.find(w => w.id === id) && win.connection?.ws?.readyState !== WebSocket.OPEN) {
-                    cdpWindows.delete(id);
                 }
             }
         } catch (e) { /* discovery failed, use cached */ }
@@ -1632,13 +1795,24 @@ async function createServer() {
             active: id === activeWindowId,
             connected: win.connection?.ws?.readyState === WebSocket.OPEN
         }));
+
+        // Final dedup: keep only the first Manager window
+        let managerSeen = false;
+        const dedupedList = windowList.filter(w => {
+            if (w.isManager) {
+                if (managerSeen) return false;
+                managerSeen = true;
+            }
+            return true;
+        });
+
         // Sort: Manager first, then alphabetical
-        windowList.sort((a, b) => {
+        dedupedList.sort((a, b) => {
             if (a.isManager && !b.isManager) return -1;
             if (!a.isManager && b.isManager) return 1;
             return a.projectName.localeCompare(b.projectName);
         });
-        res.json({ windows: windowList, activeWindowId });
+        res.json({ windows: dedupedList, activeWindowId });
     });
 
     // Switch active window
@@ -1649,14 +1823,15 @@ async function createServer() {
         const win = cdpWindows.get(windowId);
         if (!win) return res.status(404).json({ error: 'Window not found' });
 
-        // Reconnect if needed
-        if (!win.connection || win.connection.ws?.readyState !== WebSocket.OPEN) {
-            try {
-                win.connection = await connectCDP(win.url);
-                cdpWindows.set(windowId, win);
-            } catch (e) {
-                return res.status(500).json({ error: 'Failed to connect: ' + e.message });
+        // Always force-reconnect CDP — stale connections look OPEN but have dead contexts
+        try {
+            if (win.connection?.ws) {
+                try { win.connection.ws.close(); } catch (_) {}
             }
+            win.connection = await connectCDP(win.url);
+            cdpWindows.set(windowId, win);
+        } catch (e) {
+            return res.status(500).json({ error: 'Failed to connect: ' + e.message });
         }
 
         activeWindowId = windowId;
@@ -1680,6 +1855,95 @@ async function createServer() {
             activeWindowId,
             projectName: win.projectName
         });
+    });
+
+    // Close a window (Antigravity project)
+    app.post('/close-window', async (req, res) => {
+        const { windowId } = req.body;
+        if (!windowId) return res.status(400).json({ error: 'windowId required' });
+
+        const win = cdpWindows.get(windowId);
+        if (!win) return res.status(404).json({ error: 'Window not found' });
+
+        // Don't allow closing manager
+        if (win.isManager) {
+            return res.status(400).json({ error: 'Cannot close Manager window' });
+        }
+
+        const projectName = win.projectName;
+        console.log(`🗑️ Attempting to close window: ${projectName} (${windowId})`);
+
+        try {
+            // Extract the target ID from our windowId format ("target-{targetId}")
+            const targetId = windowId.replace('target-', '');
+            let closed = false;
+
+            // Strategy 1: Use Chrome DevTools HTTP API to close the target
+            // /json/close/{targetId} returns plain text, NOT JSON, so we can't use getJson
+            try {
+                await new Promise((resolve, reject) => {
+                    http.get(`http://127.0.0.1:${win.port}/json/close/${targetId}`, (response) => {
+                        let body = '';
+                        response.on('data', chunk => body += chunk);
+                        response.on('end', () => {
+                            console.log(`  /json/close response: ${body.trim()}`);
+                            closed = body.includes('closing') || response.statusCode === 200;
+                            resolve();
+                        });
+                    }).on('error', (e) => {
+                        console.log(`  /json/close failed: ${e.message}`);
+                        resolve(); // Don't reject, try next strategy
+                    });
+                });
+            } catch (e) {
+                console.log(`  /json/close error: ${e.message}`);
+            }
+
+            // Strategy 2: If /json/close didn't work, try CDP Page.close
+            if (!closed && win.connection && win.connection.ws?.readyState === WebSocket.OPEN) {
+                try {
+                    await win.connection.call('Page.close', {});
+                    closed = true;
+                    console.log(`  Closed via Page.close`);
+                } catch (e) {
+                    console.log(`  Page.close failed: ${e.message}`);
+                }
+            }
+
+            // Strategy 3: Try BrowserTarget.close via CDP
+            if (!closed && win.connection && win.connection.ws?.readyState === WebSocket.OPEN) {
+                try {
+                    await win.connection.call('Target.closeTarget', { targetId });
+                    closed = true;
+                    console.log(`  Closed via Target.closeTarget`);
+                } catch (e) {
+                    console.log(`  Target.closeTarget failed: ${e.message}`);
+                }
+            }
+
+            // Clean up from our map regardless
+            cdpWindows.delete(windowId);
+
+            // If we just closed the active window, switch to Manager or first available
+            if (activeWindowId === windowId) {
+                const remaining = [...cdpWindows.entries()];
+                const manager = remaining.find(([, w]) => w.isManager);
+                const next = manager || remaining[0];
+                if (next) {
+                    activeWindowId = next[0];
+                    cdpConnection = next[1].connection;
+                    lastSnapshot = null;
+                    lastSnapshotHash = null;
+                    console.log(`  🪟 Auto-switched to: ${next[1].projectName}`);
+                }
+            }
+
+            console.log(`🗑️ ${closed ? 'Closed' : 'Attempted to close'} window: ${projectName}`);
+            res.json({ success: true, closed, projectName, activeWindowId });
+        } catch (e) {
+            console.error(`❌ Close window error:`, e.message);
+            res.status(500).json({ error: e.message });
+        }
     });
 
     // Open a folder as a new workspace in Antigravity
@@ -1729,24 +1993,56 @@ async function createServer() {
     // List available workflows
     app.get('/list-workflows', (req, res) => {
         try {
-            // Search for workflows in project dir and common locations
+            const projectsDir = process.env.PROJECTS_DIR || (process.platform === 'win32' ? 'C:\\Proyects' : join(os.homedir(), 'Projects'));
+
+            // Determine current project path from active window
+            let activeProjectDir = null;
+            if (activeWindowId && cdpWindows.has(activeWindowId)) {
+                const win = cdpWindows.get(activeWindowId);
+                if (win.projectName && win.projectName !== '⚡ Manager') {
+                    activeProjectDir = join(projectsDir, win.projectName);
+                }
+            }
+
+            // Search multiple possible workflow locations
             const workflowDirs = [
+                // Global workflows (shared across all projects)
+                join(projectsDir, 'gemini', 'workflows'),
+                join(projectsDir, '.gemini', 'workflows'),
+                // Phone-connect's own workflows
                 join(__dirname, '.agent', 'workflows'),
+                join(__dirname, '.agents', 'workflows'),
+                join(__dirname, '_agent', 'workflows'),
             ];
+
+            // Add active project's workflow dirs
+            if (activeProjectDir) {
+                workflowDirs.push(
+                    join(activeProjectDir, '.agent', 'workflows'),
+                    join(activeProjectDir, '.agents', 'workflows'),
+                    join(activeProjectDir, '_agent', 'workflows'),
+                    join(activeProjectDir, '_agents', 'workflows'),
+                );
+            }
+
             const workflows = [];
+            const seen = new Set(); // Deduplicate by name
+
             for (const dir of workflowDirs) {
                 if (!fs.existsSync(dir)) continue;
                 const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
                 for (const file of files) {
-                    const name = file.replace('.md', '');
+                    const name = '/' + file.replace('.md', '');
+                    if (seen.has(name)) continue;
+                    seen.add(name);
                     // Read first line for description
                     try {
                         const content = fs.readFileSync(join(dir, file), 'utf8');
                         const descMatch = content.match(/description:\s*(.+)/i);
                         const desc = descMatch ? descMatch[1].trim() : name;
-                        workflows.push({ name: '/' + name, description: desc, file });
+                        workflows.push({ name, description: desc, file });
                     } catch (e) {
-                        workflows.push({ name: '/' + name, description: name, file });
+                        workflows.push({ name, description: name, file });
                     }
                 }
             }
@@ -2240,7 +2536,10 @@ return { ok: false, error: 'all_strategies_failed', editorTag: editor.tagName, e
         const TIMEOUT_MS = 30000; // 30 second timeout
 
         try {
-            const proc = spawn('powershell', ['-NoProfile', '-Command', command], {
+            const isWin = process.platform === 'win32';
+            const shell = isWin ? 'powershell' : '/bin/sh';
+            const shellArgs = isWin ? ['-NoProfile', '-Command', command] : ['-c', command];
+            const proc = spawn(shell, shellArgs, {
                 cwd: process.cwd(),
                 env: process.env,
                 windowsHide: true
@@ -2381,6 +2680,171 @@ return { ok: false, error: 'all_strategies_failed', editorTag: editor.tagName, e
         res.json(result);
     });
 
+    // Close a conversation tab in Antigravity via CDP
+    app.post('/close-tab', async (req, res) => {
+        const { title } = req.body;
+        if (!title) return res.status(400).json({ error: 'Tab title required' });
+        if (!cdpConnection) return res.status(503).json({ error: 'CDP disconnected' });
+
+        const safeTitle = JSON.stringify(title);
+
+        // Strategy 1: Try DOM-based approaches (find close button, middle-click, context menu)
+        const EXP = `(async () => {
+    try {
+        const targetTitle = ${safeTitle};
+
+        // Find tab element by title text
+        const allElements = Array.from(document.querySelectorAll('div, span, a, button'));
+        let tabElement = null;
+        let maxDepth = -1;
+        
+        for (const el of allElements) {
+            if (el.offsetParent === null) continue;
+            if (el.children.length > 10) continue;
+            const text = (el.innerText || el.textContent || '').trim();
+            if (!text) continue;
+            
+            const matchLen = Math.min(25, targetTitle.length, text.length);
+            if (text.substring(0, matchLen) === targetTitle.substring(0, matchLen) ||
+                targetTitle.startsWith(text.substring(0, matchLen))) {
+                
+                const parent = el.closest('[class*="tab"], [role="tab"], [data-tab]') || el.parentElement;
+                if (!parent) continue;
+                
+                let depth = 0;
+                let p = el;
+                while (p) { depth++; p = p.parentElement; }
+                
+                if (depth > maxDepth) {
+                    maxDepth = depth;
+                    tabElement = el;
+                }
+            }
+        }
+        
+        if (tabElement) {
+            // Walk up to find the tab container
+            let tabContainer = tabElement;
+            for (let i = 0; i < 5; i++) {
+                if (!tabContainer.parentElement) break;
+                const cls = (tabContainer.className || '').toString().toLowerCase();
+                if (cls.includes('tab') || tabContainer.getAttribute('role') === 'tab') break;
+                tabContainer = tabContainer.parentElement;
+            }
+            
+            // Look for a close/X button within the tab container
+            const closeBtn = tabContainer.querySelector(
+                'svg.lucide-x, svg.lucide-close, svg[class*="close"], svg[class*="x"],' +
+                'button[class*="close"], button[aria-label*="close"], button[aria-label*="Close"],' +
+                '[class*="close-btn"], [class*="closeBtn"]'
+            );
+            
+            if (closeBtn) {
+                const btn = closeBtn.closest('button') || closeBtn;
+                btn.click();
+                return { success: true, method: 'close_button', title: targetTitle };
+            }
+            
+            // Middle-click the tab
+            try {
+                const rect = tabContainer.getBoundingClientRect();
+                tabContainer.dispatchEvent(new MouseEvent('auxclick', {
+                    bubbles: true, button: 1, clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2
+                }));
+                return { success: true, method: 'middle_click', title: targetTitle };
+            } catch(e) {}
+            
+            // Right-click context menu
+            try {
+                const rect = tabContainer.getBoundingClientRect();
+                tabContainer.dispatchEvent(new MouseEvent('contextmenu', {
+                    bubbles: true, button: 2, clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2
+                }));
+                await new Promise(r => setTimeout(r, 500));
+                
+                const menuItems = Array.from(document.querySelectorAll('[class*="menu"] [class*="item"], [role="menuitem"]'));
+                const closeItem = menuItems.find(item => {
+                    const t = (item.textContent || '').toLowerCase();
+                    return t.includes('close') && !t.includes('close all') && !t.includes('close other');
+                });
+                if (closeItem) {
+                    closeItem.click();
+                    return { success: true, method: 'context_menu_close', title: targetTitle };
+                }
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            } catch(e) {}
+        }
+        
+        // Return tab coordinates if found, for keyboard shortcut fallback
+        if (tabElement) {
+            const rect = tabElement.getBoundingClientRect();
+            return { success: false, needsKeyboard: true, x: Math.round(rect.left + rect.width/2), y: Math.round(rect.top + rect.height/2), title: targetTitle };
+        }
+        return { success: false, error: 'tab_not_found', title: targetTitle };
+    } catch(e) {
+        return { error: e.toString() };
+    }
+})()`;
+
+        // Try DOM strategies first
+        for (const ctx of cdpConnection.contexts) {
+            try {
+                const result = await cdpConnection.call('Runtime.evaluate', {
+                    expression: EXP,
+                    returnByValue: true,
+                    awaitPromise: true,
+                    contextId: ctx.id
+                });
+                const val = result.result?.value;
+                if (val && val.success) {
+                    console.log(`🗑️ Closed tab "${title}" via ${val.method}`);
+                    return res.json(val);
+                }
+
+                // Strategy 2: CDP keyboard shortcut (Cmd+W on macOS, Ctrl+W otherwise)
+                // First click the tab to select it, then send the shortcut
+                if (val && val.needsKeyboard && val.x && val.y) {
+                    try {
+                        // Click the tab to make sure it's focused
+                        await cdpConnection.call('Input.dispatchMouseEvent', {
+                            type: 'mousePressed', x: val.x, y: val.y, button: 'left', clickCount: 1
+                        });
+                        await cdpConnection.call('Input.dispatchMouseEvent', {
+                            type: 'mouseReleased', x: val.x, y: val.y, button: 'left', clickCount: 1
+                        });
+                        await new Promise(r => setTimeout(r, 300));
+
+                        // Send Cmd+W (macOS) / Ctrl+W (other) via CDP native key events
+                        const isMac = process.platform === 'darwin';
+                        const modifiers = isMac ? 4 : 2; // 4=Meta(Cmd), 2=Control
+                        await cdpConnection.call('Input.dispatchKeyEvent', {
+                            type: 'keyDown',
+                            key: 'w',
+                            code: 'KeyW',
+                            windowsVirtualKeyCode: 87,
+                            nativeVirtualKeyCode: 87,
+                            modifiers
+                        });
+                        await cdpConnection.call('Input.dispatchKeyEvent', {
+                            type: 'keyUp',
+                            key: 'w',
+                            code: 'KeyW',
+                            windowsVirtualKeyCode: 87,
+                            nativeVirtualKeyCode: 87,
+                            modifiers
+                        });
+
+                        console.log(`🗑️ Closed tab "${title}" via keyboard shortcut (${isMac ? 'Cmd' : 'Ctrl'}+W)`);
+                        return res.json({ success: true, method: 'keyboard_shortcut', title });
+                    } catch (keyErr) {
+                        console.warn(`⚠️ Keyboard shortcut close failed:`, keyErr.message);
+                    }
+                }
+            } catch (e) { }
+        }
+        res.json({ success: false, error: 'Could not close tab' });
+    });
+
     // Get current active conversation title
     app.get('/current-conversation', async (req, res) => {
         if (!cdpConnection) return res.json({ title: null, error: 'CDP disconnected' });
@@ -2451,6 +2915,225 @@ return { ok: false, error: 'all_strategies_failed', editorTag: editor.tagName, e
     // --- Markdown File Viewer API ---
     const ARTIFACTS_BASE = join(os.homedir(), '.gemini', 'antigravity', 'brain');
 
+    // Find an artifact .md file by title search across all conversations
+    app.get('/api/find-artifact', (req, res) => {
+        const title = (req.query.title || '').trim();
+        if (!title) return res.status(400).json({ error: 'title required' });
+
+        try {
+            // Convert title to possible filenames
+            const snakeCase = title.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+            const possibleNames = [
+                snakeCase + '.md',
+                snakeCase.replace(/_/g, '-') + '.md',
+            ];
+
+            // Search all conversation directories in brain/
+            if (!fs.existsSync(ARTIFACTS_BASE)) {
+                return res.status(404).json({ error: 'Brain directory not found' });
+            }
+
+            const convDirs = fs.readdirSync(ARTIFACTS_BASE, { withFileTypes: true })
+                .filter(d => d.isDirectory() && !d.name.startsWith('.'));
+
+            // Search most recent first (sorted reverse by mtime)
+            const dirsWithTime = convDirs.map(d => {
+                const dirPath = join(ARTIFACTS_BASE, d.name);
+                try {
+                    return { name: d.name, path: dirPath, mtime: fs.statSync(dirPath).mtimeMs };
+                } catch { return { name: d.name, path: dirPath, mtime: 0 }; }
+            }).sort((a, b) => b.mtime - a.mtime);
+
+            for (const dir of dirsWithTime) {
+                try {
+                    const files = fs.readdirSync(dir.path).filter(f => f.endsWith('.md'));
+                    for (const file of files) {
+                        const lower = file.toLowerCase();
+                        // Check filename match
+                        if (possibleNames.some(n => lower === n)) {
+                            const fullPath = join(dir.path, file);
+                            const content = fs.readFileSync(fullPath, 'utf-8');
+                            return res.json({
+                                found: true,
+                                path: dir.name + '/' + file,
+                                absPath: fullPath,
+                                content,
+                                name: file
+                            });
+                        }
+                    }
+                } catch (e) { /* skip */ }
+            }
+
+            // Fallback: search file contents for the title
+            for (const dir of dirsWithTime) {
+                try {
+                    const files = fs.readdirSync(dir.path).filter(f => f.endsWith('.md'));
+                    for (const file of files) {
+                        const fullPath = join(dir.path, file);
+                        const content = fs.readFileSync(fullPath, 'utf-8');
+                        // Check if file starts with a heading matching the title
+                        const firstLine = content.split('\n')[0] || '';
+                        if (firstLine.toLowerCase().includes(title.toLowerCase())) {
+                            return res.json({
+                                found: true,
+                                path: dir.name + '/' + file,
+                                absPath: fullPath,
+                                content,
+                                name: file
+                            });
+                        }
+                    }
+                } catch (e) { /* skip */ }
+            }
+
+            // Not found — list all available .md files in most recent conversation
+            const available = [];
+            if (dirsWithTime.length > 0) {
+                const recentDir = dirsWithTime[0];
+                try {
+                    const files = fs.readdirSync(recentDir.path).filter(f => f.endsWith('.md'));
+                    files.forEach(f => available.push(recentDir.name + '/' + f));
+                } catch (e) {}
+            }
+            return res.status(404).json({ error: 'Artifact not found', searched: title, available });
+        } catch (e) {
+            console.error('Find artifact error:', e);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // --- Projects Directory API ---
+    const PROJECTS_BASE = join(os.homedir(), '.gemini', 'antigravity', 'proyects');
+
+    app.get('/api/projects', (req, res) => {
+        try {
+            if (!fs.existsSync(PROJECTS_BASE)) {
+                return res.json({ projects: [], basePath: PROJECTS_BASE });
+            }
+            const entries = fs.readdirSync(PROJECTS_BASE, { withFileTypes: true });
+            const projects = entries
+                .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+                .map(e => {
+                    const dirPath = join(PROJECTS_BASE, e.name);
+                    let mtime = 0;
+                    try { mtime = fs.statSync(dirPath).mtimeMs; } catch {}
+                    return { name: e.name, mtime };
+                })
+                .sort((a, b) => b.mtime - a.mtime);
+            res.json({ projects, basePath: PROJECTS_BASE });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // Create a new project folder
+    app.post('/api/create-project-folder', (req, res) => {
+        const { name } = req.body;
+        if (!name || typeof name !== 'string') {
+            return res.status(400).json({ error: 'Folder name is required' });
+        }
+        // Validate: only alphanumeric, hyphens, underscores, dots
+        const safeName = name.trim();
+        if (!safeName || /[\/\\:*?"<>|]/.test(safeName) || safeName.includes('..')) {
+            return res.status(400).json({ error: 'Invalid folder name' });
+        }
+        const folderPath = join(PROJECTS_BASE, safeName);
+        if (fs.existsSync(folderPath)) {
+            return res.status(409).json({ error: 'Folder already exists' });
+        }
+        try {
+            fs.mkdirSync(folderPath, { recursive: true });
+            console.log(`📁 Created project folder: ${folderPath}`);
+            res.json({ success: true, name: safeName, path: folderPath });
+        } catch (e) {
+            console.error(`⚠️ Create folder error: ${e.message}`);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // Browse files inside a project directory
+    app.get('/api/project-files', (req, res) => {
+        const project = req.query.project || '';
+        const subdir = req.query.dir || '';
+        const targetDir = join(PROJECTS_BASE, project, subdir);
+
+        // Security: prevent directory traversal
+        if (!targetDir.startsWith(PROJECTS_BASE)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        try {
+            if (!fs.existsSync(targetDir)) {
+                return res.json({ files: [], dirs: [], currentDir: subdir, project });
+            }
+
+            const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+            const dirs = [];
+            const files = [];
+
+            // Browsable extensions for project files
+            const BROWSABLE_EXTS = ['.md', '.json', '.js', '.ts', '.tsx', '.jsx', '.css', '.html', '.env', '.yml', '.yaml', '.toml', '.prisma', '.sql', '.sh', '.dart', '.swift', '.py', '.go', '.rs'];
+            const SKIP_DIRS = ['node_modules', '.git', '.next', 'build', 'dist', '.dart_tool', '.idea', '__pycache__'];
+
+            for (const entry of entries) {
+                if (entry.name.startsWith('.') && entry.name !== '.env') continue;
+                const entryPath = join(targetDir, entry.name);
+
+                if (entry.isDirectory()) {
+                    if (SKIP_DIRS.includes(entry.name)) continue;
+                    let fileCount = 0;
+                    let dirMtime = 0;
+                    try {
+                        const subEntries = fs.readdirSync(entryPath);
+                        fileCount = subEntries.length;
+                        dirMtime = fs.statSync(entryPath).mtimeMs;
+                    } catch {}
+                    dirs.push({ name: entry.name, fileCount, mtime: dirMtime });
+                } else {
+                    const ext = entry.name.substring(entry.name.lastIndexOf('.')).toLowerCase();
+                    if (BROWSABLE_EXTS.includes(ext) || entry.name === 'Dockerfile' || entry.name === 'Makefile') {
+                        const stat = fs.statSync(entryPath);
+                        files.push({
+                            name: entry.name,
+                            size: stat.size,
+                            modified: stat.mtime.toISOString(),
+                            type: ext === '.md' ? 'markdown' : 'code',
+                            absolutePath: entryPath
+                        });
+                    }
+                }
+            }
+
+            dirs.sort((a, b) => b.mtime - a.mtime);
+            files.sort((a, b) => new Date(b.modified) - new Date(a.modified));
+            res.json({ files, dirs, currentDir: subdir, project });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // Read a project file's content
+    app.get('/api/project-file-content', (req, res) => {
+        const filePath = req.query.path || '';
+        const fullPath = join(PROJECTS_BASE, filePath);
+
+        if (!fullPath.startsWith(PROJECTS_BASE)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        try {
+            if (!fs.existsSync(fullPath)) {
+                return res.status(404).json({ error: 'File not found' });
+            }
+            const content = fs.readFileSync(fullPath, 'utf8');
+            const ext = fullPath.substring(fullPath.lastIndexOf('.')).toLowerCase();
+            res.json({ content, type: ext === '.md' ? 'markdown' : 'code', path: filePath });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     // List .md files in subdirectories
     app.get('/api/files', (req, res) => {
         const subdir = req.query.dir || '';
@@ -2470,29 +3153,42 @@ return { ok: false, error: 'all_strategies_failed', editorTag: editor.tagName, e
             const dirs = [];
             const files = [];
 
+            // Browsable file extensions
+            const BROWSABLE_EXTS = ['.md', '.png', '.webp', '.jpg', '.jpeg', '.svg', '.gif'];
+            const IMAGE_EXTS = ['.png', '.webp', '.jpg', '.jpeg', '.svg', '.gif'];
+
             for (const entry of entries) {
                 if (entry.name.startsWith('.')) continue; // skip hidden
 
+                const entryPath = join(targetDir, entry.name);
                 if (entry.isDirectory()) {
-                    // Count .md files in this subdirectory (1 level deep)
-                    let mdCount = 0;
+                    // Count browsable files in this subdirectory (1 level deep)
+                    let fileCount = 0;
+                    let dirMtime = 0;
                     try {
-                        const subEntries = fs.readdirSync(join(targetDir, entry.name));
-                        mdCount = subEntries.filter(f => f.endsWith('.md')).length;
+                        const subEntries = fs.readdirSync(entryPath);
+                        fileCount = subEntries.filter(f => BROWSABLE_EXTS.some(ext => f.endsWith(ext))).length;
+                        dirMtime = fs.statSync(entryPath).mtimeMs;
                     } catch { }
-                    dirs.push({ name: entry.name, mdCount });
-                } else if (entry.name.endsWith('.md')) {
-                    const stat = fs.statSync(join(targetDir, entry.name));
-                    files.push({
-                        name: entry.name,
-                        size: stat.size,
-                        modified: stat.mtime.toISOString()
-                    });
+                    dirs.push({ name: entry.name, fileCount, mtime: dirMtime });
+                } else {
+                    const ext = entry.name.substring(entry.name.lastIndexOf('.')).toLowerCase();
+                    if (BROWSABLE_EXTS.includes(ext)) {
+                        const stat = fs.statSync(entryPath);
+                        const isImage = IMAGE_EXTS.includes(ext);
+                        files.push({
+                            name: entry.name,
+                            size: stat.size,
+                            modified: stat.mtime.toISOString(),
+                            type: isImage ? 'image' : 'markdown',
+                            absolutePath: entryPath
+                        });
+                    }
                 }
             }
 
-            // Sort: dirs first alphabetically, then files by modification date (newest first)
-            dirs.sort((a, b) => a.name.localeCompare(b.name));
+            // Sort: dirs by newest first, files by newest first
+            dirs.sort((a, b) => b.mtime - a.mtime);
             files.sort((a, b) => new Date(b.modified) - new Date(a.modified));
 
             res.json({ files, dirs, currentDir: subdir, basePath: ARTIFACTS_BASE });
@@ -2532,6 +3228,90 @@ return { ok: false, error: 'all_strategies_failed', editorTag: editor.tagName, e
         }
     });
 
+    // Proxy local images for chat snapshot viewing
+    // Security: Only allow image files within user's home directory
+    app.get('/api/serve-image', (req, res) => {
+        const filePath = req.query.path || '';
+        const homeDir = os.homedir();
+
+        if (!filePath.startsWith('/')) {
+            return res.status(400).json({ error: 'Absolute path required' });
+        }
+
+        // Normalize to prevent traversal
+        const resolved = join(filePath);
+        if (!resolved.startsWith(homeDir)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        // Only allow image extensions
+        const ext = resolved.split('.').pop().toLowerCase();
+        const mimeTypes = {
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'svg': 'image/svg+xml',
+            'ico': 'image/x-icon',
+            'bmp': 'image/bmp'
+        };
+        const mime = mimeTypes[ext];
+        if (!mime) {
+            return res.status(403).json({ error: 'Not an image file' });
+        }
+
+        try {
+            if (!fs.existsSync(resolved)) {
+                return res.status(404).json({ error: 'Image not found' });
+            }
+            res.setHeader('Content-Type', mime);
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            fs.createReadStream(resolved).pipe(res);
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // Read a file by absolute path (for artifact links in chat)
+    // Security: Only allow .md files within user's home directory
+    app.get('/api/read-file', (req, res) => {
+        const filePath = req.query.path || '';
+        const homeDir = os.homedir();
+
+        // Security checks
+        if (!filePath.startsWith('/')) {
+            return res.status(400).json({ error: 'Absolute path required' });
+        }
+        if (!filePath.endsWith('.md')) {
+            return res.status(403).json({ error: 'Only .md files allowed' });
+        }
+        // Normalize to prevent traversal
+        const resolved = join(filePath);
+        if (!resolved.startsWith(homeDir)) {
+            return res.status(403).json({ error: 'Access denied - path outside home directory' });
+        }
+
+        try {
+            if (!fs.existsSync(resolved)) {
+                return res.status(404).json({ error: 'File not found: ' + filePath.split('/').pop() });
+            }
+
+            const content = fs.readFileSync(resolved, 'utf-8');
+            const stat = fs.statSync(resolved);
+            res.json({
+                content,
+                name: resolved.split('/').pop(),
+                path: filePath,
+                size: stat.size,
+                modified: stat.mtime.toISOString()
+            });
+        } catch (e) {
+            console.error('Read file error:', e);
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     return { server, wss, app, hasSSL };
 }
 
@@ -2562,6 +3342,57 @@ async function main() {
                 console.log(`💡 First time on phone? Accept the security warning to proceed.`);
             }
         });
+
+        // Also start HTTP-only server on port 3002 for Tailscale access
+        // (Tailscale traffic is already encrypted, so HTTPS is redundant)
+        if (hasSSL) {
+            const httpFallback = http.createServer(app);
+            const httpPort = parseInt(SERVER_PORT, 10) + 1; // 3002
+
+            // WebSocket on fallback too — so Tailscale clients get live updates
+            const wssFallback = new WebSocketServer({ server: httpFallback });
+            wssFallback.on('connection', (wsClient, req) => {
+                // Reuse the same auth logic
+                const rawCookies = req.headers.cookie || '';
+                const parsedCookies = {};
+                rawCookies.split(';').forEach(c => {
+                    const [k, v] = c.trim().split('=');
+                    if (k && v) {
+                        try { parsedCookies[k] = decodeURIComponent(v); } catch (e) { parsedCookies[k] = v; }
+                    }
+                });
+
+                let isAuthenticated = false;
+                if (isLocalRequest(req)) {
+                    isAuthenticated = true;
+                } else {
+                    const signedToken = parsedCookies[AUTH_COOKIE_NAME];
+                    if (signedToken) {
+                        const token = cookieParser.signedCookie(signedToken, 'antigravity_secret_key_1337');
+                        if (token === AUTH_TOKEN) isAuthenticated = true;
+                    }
+                }
+
+                if (!isAuthenticated) {
+                    console.log('🚫 Unauthorized WebSocket connection attempt (HTTP fallback)');
+                    wsClient.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
+                    setTimeout(() => wsClient.close(), 100);
+                    return;
+                }
+
+                console.log('📱 Client connected via HTTP fallback (Authenticated)');
+                // Register in the main wss so broadcasts reach this client
+                wss.clients.add(wsClient);
+                wsClient.on('close', () => {
+                    console.log('📱 Client disconnected (HTTP fallback)');
+                    wss.clients.delete(wsClient);
+                });
+            });
+
+            httpFallback.listen(httpPort, '0.0.0.0', () => {
+                console.log(`📱 HTTP fallback on http://${localIP}:${httpPort} (for Tailscale)`);
+            });
+        }
 
         // Graceful shutdown handlers
         const gracefulShutdown = (signal) => {

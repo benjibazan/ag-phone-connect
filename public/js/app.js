@@ -39,6 +39,9 @@ let snapshotPending = false;
 let snapshotTimer = null;
 const SNAPSHOT_THROTTLE_MS = 2000; // Min time between snapshot updates
 let pendingImages = []; // Images waiting to be sent
+let isSending = false; // Guard against duplicate sends
+let currentWindows = [];
+let currentActiveWindowId = null;
 
 // --- Image Attachment ---
 attachBtn.addEventListener('click', () => imageInput.click());
@@ -96,7 +99,7 @@ async function fetchWithAuth(url, options = {}) {
         throw e;
     }
 }
-const USER_SCROLL_LOCK_DURATION = 3000; // 3 seconds of scroll protection
+const USER_SCROLL_LOCK_DURATION = 15000; // 15 seconds of scroll protection while reading
 
 // --- Sync State (Desktop is Always Priority) ---
 async function fetchAppState() {
@@ -198,22 +201,26 @@ function connectWebSocket() {
             window.location.href = '/login.html';
             return;
         }
-        if (data.type === 'snapshot_update' && autoRefreshEnabled && !userIsScrolling) {
-            // Throttle snapshot updates to avoid performance issues on mobile
+        // Handle snapshot data sent directly via WebSocket (no HTTP round-trip)
+        if (data.type === 'snapshot_data' && autoRefreshEnabled && !userIsScrolling) {
             const now = Date.now();
             const elapsed = now - lastSnapshotTime;
             if (elapsed >= SNAPSHOT_THROTTLE_MS) {
                 lastSnapshotTime = now;
-                loadSnapshot();
+                applySnapshot(data);
             } else if (!snapshotPending) {
                 snapshotPending = true;
                 clearTimeout(snapshotTimer);
                 snapshotTimer = setTimeout(() => {
                     snapshotPending = false;
                     lastSnapshotTime = Date.now();
-                    loadSnapshot();
+                    applySnapshot(data);
                 }, SNAPSHOT_THROTTLE_MS - elapsed);
             }
+        }
+        // Keep legacy support for snapshot_update
+        if (data.type === 'snapshot_update' && autoRefreshEnabled && !userIsScrolling) {
+            loadSnapshot();
         }
     };
 
@@ -236,15 +243,188 @@ function updateStatus(connected) {
     }
 }
 
+// --- Proxy local images in snapshot so phone can display them ---
+function proxyLocalImages() {
+    const imgs = chatContent.querySelectorAll('img');
+    imgs.forEach(img => {
+        const src = img.getAttribute('src') || '';
+        
+        // Rewrite file:/// URIs to use server proxy
+        if (src.startsWith('file:///')) {
+            const absPath = src.replace('file://', '');
+            img.setAttribute('src', `/api/serve-image?path=${encodeURIComponent(absPath)}`);
+            img.style.maxWidth = '100%';
+            img.style.height = 'auto';
+            img.style.borderRadius = '8px';
+        }
+        // Handle vscode-resource or other local schemes
+        else if (src.startsWith('vscode-resource:') || src.startsWith('vscode-file:')) {
+            const absPath = src.replace(/^vscode-(resource|file):\/\/\//, '/');
+            img.setAttribute('src', `/api/serve-image?path=${encodeURIComponent(absPath)}`);
+            img.style.maxWidth = '100%';
+            img.style.height = 'auto';
+        }
+        // Hide unresolvable images (blob:, chrome-extension:, etc.)
+        else if (src.startsWith('blob:') || src.startsWith('chrome-extension:') || 
+                 src.startsWith('chrome:') || src === '') {
+            img.style.display = 'none';
+        }
+        
+        // Add error handler to hide broken images
+        img.onerror = () => { img.style.display = 'none'; };
+    });
+}
+
+// --- Event delegation for "Open" buttons on artifact cards ---
+function setupArtifactOpenHandlers() {
+    // Use event delegation on chatContent instead of per-button handlers
+    // This catches clicks on any "Open" text in the snapshot
+    chatContent.addEventListener('click', handleArtifactClick);
+    chatContent.addEventListener('touchend', handleArtifactClick);
+}
+
+let _artifactHandlersSetup = false;
+function ensureArtifactHandlers() {
+    if (!_artifactHandlersSetup) {
+        setupArtifactOpenHandlers();
+        _artifactHandlersSetup = true;
+    }
+}
+
+function handleArtifactClick(e) {
+    const target = e.target;
+    const text = (target.textContent || '').trim();
+    
+    // Only handle "Open" clicks
+    if (text !== 'Open') return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Walk up to find the artifact card and extract the title
+    let artifactTitle = null;
+    let card = target.parentElement;
+    for (let i = 0; i < 6; i++) {
+        if (!card) break;
+        const cardText = (card.textContent || '').trim();
+        
+        // The card contains the title + "Open" + description
+        // Extract the title: text before "Open" that isn't part of description
+        // Look for short text nodes that are likely titles
+        const children = card.querySelectorAll('*');
+        for (const child of children) {
+            // Skip the button itself and its children
+            if (child === target || child.contains(target) || target.contains(child)) continue;
+            
+            const childText = (child.textContent || '').trim();
+            // Title candidates: short text (3-60 chars), not the description (descriptions are long)
+            if (childText.length >= 3 && childText.length <= 60 && 
+                !childText.includes('Open') && !childText.includes('Proceed') &&
+                !childText.includes('Copy') && childText !== text) {
+                // Check this is a "leaf" text element (no child elements with text)
+                const childChildren = child.querySelectorAll('*');
+                let isLeaf = true;
+                for (const cc of childChildren) {
+                    if ((cc.textContent || '').trim().length > 0) { isLeaf = false; break; }
+                }
+                if (isLeaf || child.children.length === 0) {
+                    artifactTitle = childText;
+                    break;
+                }
+            }
+        }
+        if (artifactTitle) break;
+        card = card.parentElement;
+    }
+
+    if (!artifactTitle) {
+        console.log('Could not extract artifact title');
+        return;
+    }
+
+    // Remove any emoji at the start and "📋" type chars
+    artifactTitle = artifactTitle.replace(/^[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\s]+/u, '').trim();
+    console.log('Opening artifact:', artifactTitle);
+
+    // Search the server for this artifact
+    openArtifactByTitle(artifactTitle);
+}
+
+async function openArtifactByTitle(title) {
+    try {
+        const res = await fetchWithAuth(`/api/find-artifact?title=${encodeURIComponent(title)}`);
+        const data = await res.json();
+        
+        if (data.found && data.content) {
+            // Show in the markdown viewer
+            filesViewingFile = true;
+            filesNavStack.push(filesCurrentDir);
+            filesTitle.textContent = data.name || title;
+            filesLayer.classList.add('show');
+            
+            // Render markdown content
+            const rendered = typeof marked !== 'undefined' ? marked.parse(data.content) : 
+                data.content.replace(/\n/g, '<br>');
+            
+            filesContent.innerHTML = `
+                <div style="padding: 16px 20px; font-size: 14px; line-height: 1.7; color: #e2e8f0;">
+                    <style>
+                        .md-viewer h1 { font-size: 1.5em; font-weight: 700; margin: 16px 0 8px; color: #f1f5f9; border-bottom: 1px solid #334155; padding-bottom: 8px; }
+                        .md-viewer h2 { font-size: 1.3em; font-weight: 600; margin: 14px 0 6px; color: #f1f5f9; }
+                        .md-viewer h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 4px; color: #f1f5f9; }
+                        .md-viewer p { margin: 8px 0; }
+                        .md-viewer ul, .md-viewer ol { padding-left: 20px; margin: 8px 0; }
+                        .md-viewer li { margin: 4px 0; }
+                        .md-viewer code { background: rgba(59,130,246,0.15); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+                        .md-viewer pre { background: #1e293b; padding: 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
+                        .md-viewer pre code { background: none; padding: 0; }
+                        .md-viewer blockquote { border-left: 3px solid #3b82f6; padding: 8px 12px; margin: 8px 0; background: rgba(59,130,246,0.1); }
+                        .md-viewer a { color: #60a5fa; }
+                        .md-viewer table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+                        .md-viewer th, .md-viewer td { border: 1px solid #334155; padding: 6px 8px; }
+                        .md-viewer th { background: #1e293b; }
+                        .md-viewer hr { border: none; border-top: 1px solid #334155; margin: 16px 0; }
+                    </style>
+                    <div class="md-viewer">${rendered}</div>
+                </div>`;
+        } else {
+            // Show error with available files
+            const availableHtml = data.available?.length ? 
+                '<br><br>Available files:<br>' + data.available.map(f => 
+                    `<a href="#" style="color: #60a5fa; display: block; padding: 4px 0;" onclick="event.preventDefault(); openMarkdownFile('${f}')">${f}</a>`
+                ).join('') : '';
+            
+            filesViewingFile = true;
+            filesTitle.textContent = 'Not Found';
+            filesLayer.classList.add('show');
+            filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: #94a3b8;">
+                Could not find artifact: "${title}"${availableHtml}
+            </div>`;
+        }
+    } catch (e) {
+        console.error('Find artifact error:', e);
+    }
+}
+
 // --- Post-process snapshot to make .md artifact links clickable ---
 function makeArtifactLinksClickable() {
     // Find all links in the chat content
     const links = chatContent.querySelectorAll('a[href]');
     links.forEach(link => {
         const href = link.getAttribute('href') || '';
-        // Match file:/// links to .md files in the brain directory
+
+        // Match file:/// links to .md files
+        if (href.startsWith('file:///') && href.endsWith('.md')) {
+            const absPath = href.replace('file://', '');
+            link.setAttribute('href', '#');
+            link.style.cssText = 'color: #60a5fa !important; cursor: pointer; text-decoration: underline; background: rgba(59,130,246,0.1); padding: 2px 6px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px;';
+            link.innerHTML = '📄 ' + link.textContent;
+            link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openAbsoluteFile(absPath); };
+            return;
+        }
+
+        // Match relative brain/ links to .md files
         if (href.endsWith('.md') && (href.includes('brain') || href.includes('.gemini'))) {
-            // Extract the relative path from the brain directory
             const brainMatch = href.match(/brain[\\/](.+\.md)/);
             if (brainMatch) {
                 const relativePath = brainMatch[1].replace(/\\/g, '/');
@@ -255,6 +435,9 @@ function makeArtifactLinksClickable() {
             }
         }
     });
+
+    // Note: "Open" buttons on artifact cards are handled by event delegation
+    // in handleArtifactClick() - no per-button setup needed here
 
     // Also find text nodes mentioning .md file paths and wrap them
     const walker = document.createTreeWalker(chatContent, NodeFilter.SHOW_TEXT, null, false);
@@ -302,10 +485,262 @@ function makeArtifactLinksClickable() {
     });
 }
 
-// --- Rendering ---
+// Open a markdown file by absolute path
+async function openAbsoluteFile(absPath) {
+    filesViewingFile = true;
+    filesNavStack.push(filesCurrentDir);
+    const fileName = absPath.split(/[\\/]/).pop();
+    filesTitle.textContent = fileName;
+    filesLayer.classList.add('show');
+
+    filesContent.innerHTML = `
+        <div style="padding: 40px 20px; text-align: center; color: white;">
+            <div class="loading-spinner"></div>
+            <p style="margin-top: 10px; opacity: 0.7;">Loading ${escapeHtml(fileName)}...</p>
+        </div>
+    `;
+
+    try {
+        const res = await fetchWithAuth(`/api/read-file?path=${encodeURIComponent(absPath)}`);
+        const data = await res.json();
+
+        if (data.error) {
+            filesContent.innerHTML = `<div style="padding: 20px; color: #ef4444;">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+
+        const rendered = renderMarkdown(data.content);
+        filesContent.innerHTML = `<div class="md-viewer">${rendered}</div>`;
+    } catch (e) {
+        console.error('File read error:', e);
+        filesContent.innerHTML = `<div style="padding: 20px; color: #ef4444;">Error reading file</div>`;
+    }
+}
+
+// --- CSS Injection (cached, only runs once) ---
+let _cssInjected = false;
+function injectCSSOnce(baseCss) {
+    if (_cssInjected) return;
+    _cssInjected = true;
+
+    let styleTag = document.getElementById('cdp-styles');
+    if (!styleTag) {
+        styleTag = document.createElement('style');
+        styleTag.id = 'cdp-styles';
+        document.head.appendChild(styleTag);
+    }
+
+    styleTag.textContent = '/* --- BASE SNAPSHOT CSS --- */\n' +
+        (baseCss || '') + // Use baseCss if provided, otherwise empty string
+        '\n\n/* --- FORCE DARK MODE OVERRIDES --- */\n' +
+        ':root {\n' +
+        '    --bg-app: #0f172a;\n' +
+        '    --text-main: #f8fafc;\n' +
+        '    --text-muted: #94a3b8;\n' +
+        '    --border-color: #334155;\n' +
+        '}\n' +
+        '\n' +
+        '#conversation, #chat, #cascade {\n' +
+        '    background-color: transparent !important;\n' +
+        '    color: var(--text-main) !important;\n' +
+        '    font-family: \'Inter\', system-ui, sans-serif !important;\n' +
+        '    position: relative !important;\n' +
+        '    height: auto !important;\n' +
+        '    width: 100% !important;\n' +
+        '}\n' +
+        '\n' +
+        '#conversation *, #chat *, #cascade * {\n' +
+        '    position: static !important;\n' +
+        '}\n' +
+        '\n' +
+        '#conversation p, #chat p, #cascade p, #conversation h1, #chat h1, #cascade h1, #conversation h2, #chat h2, #cascade h2, #conversation h3, #chat h3, #cascade h3, #conversation h4, #chat h4, #cascade h4, #conversation h5, #chat h5, #cascade h5, #conversation span, #chat span, #cascade span, #conversation div, #chat div, #cascade div, #conversation li, #chat li, #cascade li {\n' +
+        '    color: inherit !important;\n' +
+        '}\n' +
+        '\n' +
+        '#conversation a, #chat a, #cascade a {\n' +
+        '    color: #60a5fa !important;\n' +
+        '    text-decoration: underline;\n' +
+        '}\n' +
+        '\n' +
+        '/* Fix Inline Code - Ultra-compact */\n' +
+        ':not(pre) > code {\n' +
+        '    padding: 0px 2px !important;\n' +
+        '    border-radius: 2px !important;\n' +
+        '    background-color: rgba(255, 255, 255, 0.1) !important;\n' +
+        '    font-size: 0.82em !important;\n' +
+        '    line-height: 1 !important;\n' +
+        '    white-space: normal !important;\n' +
+        '}\n' +
+        '\n' +
+        'pre, code, .monaco-editor-background, [class*="terminal"] {\n' +
+        '    background-color: #1e293b !important;\n' +
+        '    color: #e2e8f0 !important;\n' +
+        '    font-family: \'JetBrains Mono\', monospace !important;\n' +
+        '    border-radius: 3px;\n' +
+        '    border: 1px solid #334155;\n' +
+        '}\n' +
+        '                \n' +
+        '/* Multi-line Code Block - Minimal */\n' +
+        'pre {\n' +
+        '    position: relative !important;\n' +
+        '    white-space: pre-wrap !important; \n' +
+        '    word-break: break-word !important;\n' +
+        '    padding: 4px 6px !important;\n' +
+        '    margin: 2px 0 !important;\n' +
+        '    display: block !important;\n' +
+        '    width: 100% !important;\n' +
+        '}\n' +
+        '                \n' +
+        'pre.has-copy-btn {\n' +
+        '    padding-right: 28px !important;\n' +
+        '}\n' +
+        '                \n' +
+        '/* Single-line Code Block - Minimal */\n' +
+        'pre.single-line-pre {\n' +
+        '    display: inline-block !important;\n' +
+        '    width: auto !important;\n' +
+        '    max-width: 100% !important;\n' +
+        '    padding: 0px 4px !important;\n' +
+        '    margin: 0px !important;\n' +
+        '    vertical-align: middle !important;\n' +
+        '    background-color: #1e293b !important;\n' +
+        '    font-size: 0.85em !important;\n' +
+        '}\n' +
+        '                \n' +
+        'pre.single-line-pre > code {\n' +
+        '    display: inline !important;\n' +
+        '    white-space: nowrap !important;\n' +
+        '}\n' +
+        '                \n' +
+        'pre:not(.single-line-pre) > code {\n' +
+        '    display: block !important;\n' +
+        '    width: 100% !important;\n' +
+        '    overflow-x: auto !important;\n' +
+        '    background: transparent !important;\n' +
+        '    border: none !important;\n' +
+        '    padding: 0 !important;\n' +
+        '    margin: 0 !important;\n' +
+        '}\n' +
+        '                \n' +
+        '.mobile-copy-btn {\n' +
+        '    position: absolute !important;\n' +
+        '    top: 2px !important;\n' +
+        '    right: 2px !important;\n' +
+        '    background: rgba(30, 41, 59, 0.5) !important;\n' +
+        '    color: #94a3b8 !important;\n' +
+        '    border: none !important;\n' +
+        '    width: 24px !important; \n' +
+        '    height: 24px !important;\n' +
+        '    padding: 0 !important;\n' +
+        '    cursor: pointer !important;\n' +
+        '    display: flex !important;\n' +
+        '    align-items: center !important;\n' +
+        '    justify-content: center !important;\n' +
+        '    border-radius: 4px !important;\n' +
+        '    transition: all 0.2s ease !important;\n' +
+        '    -webkit-tap-highlight-color: transparent !important;\n' +
+        '    z-index: 10 !important;\n' +
+        '    margin: 0 !important;\n' +
+        '}\n' +
+        '                \n' +
+        '.mobile-copy-btn:hover,\n' +
+        '.mobile-copy-btn:focus {\n' +
+        '    background: rgba(59, 130, 246, 0.2) !important;\n' +
+        '    color: #60a5fa !important;\n' +
+        '}\n' +
+        '                \n' +
+        '.mobile-copy-btn svg {\n' +
+        '    width: 16px !important;\n' +
+        '    height: 16px !important;\n' +
+        '    stroke: currentColor !important;\n' +
+        '    stroke-width: 2 !important;\n' +
+        '    fill: none !important;\n' +
+        '}\n' +
+        '                \n' +
+        'blockquote {\n' +
+        '    border-left: 3px solid #3b82f6 !important;\n' +
+        '    background: rgba(59, 130, 246, 0.1) !important;\n' +
+        '    color: #cbd5e1 !important;\n' +
+        '    padding: 8px 12px !important;\n' +
+        '    margin: 8px 0 !important;\n' +
+        '}\n' +
+        '\n' +
+        'table {\n' +
+        '    border-collapse: collapse !important;\n' +
+        '    width: 100% !important;\n' +
+        '    border: 1px solid #334155 !important;\n' +
+        '}\n' +
+        'th, td {\n' +
+        '    border: 1px solid #334155 !important;\n' +
+        '    padding: 8px !important;\n' +
+        '    color: #e2e8f0 !important;\n' +
+        '}\n' +
+        '\n' +
+        '::-webkit-scrollbar {\n' +
+        '    width: 0 !important;\n' +
+        '}\n' +
+        '                \n' +
+        '[style*="background-color: rgb(255, 255, 255)"],\n' +
+        '[style*="background-color: white"],\n' +
+        '[style*="background: white"] {\n' +
+        '    background-color: transparent !important;\n' +
+        '}';
+}
+
+// --- Core rendering: apply snapshot data to DOM ---
+function applySnapshot(data) {
+    // Discard snapshots from a different window (race condition during switch)
+    if (data.windowId && currentActiveWindowId && data.windowId !== currentActiveWindowId) {
+        console.log('[SNAPSHOT] Discarding stale snapshot from', data.projectName || data.windowId);
+        return;
+    }
+
+    chatIsOpen = true;
+
+    // Capture scroll state BEFORE updating content
+    const scrollPos = chatContainer.scrollTop;
+    const scrollHeight = chatContainer.scrollHeight;
+    const clientHeight = chatContainer.clientHeight;
+    const isNearBottom = scrollHeight - scrollPos - clientHeight < 120;
+    const isUserScrollLocked = Date.now() < userScrollLockUntil;
+
+    // --- UPDATE STATS ---
+    if (data.stats) {
+        const kbs = Math.round((data.stats.htmlSize || 0) / 1024);
+        const nodes = data.stats.nodes;
+        const statsText = document.getElementById('statsText');
+        if (statsText) statsText.textContent = `${nodes} Nodes · ${kbs}KB`;
+    }
+
+    // Inject CSS once (cached)
+    injectCSSOnce(data.css);
+
+    // Update HTML
+    chatContent.innerHTML = data.html;
+
+    // Setup delegated handlers (only once)
+    ensureArtifactHandlers();
+
+    // Smart scroll behavior: respect user scroll, only auto-scroll when near bottom
+    if (isUserScrollLocked) {
+        chatContainer.scrollTop = scrollPos;
+    } else if (isNearBottom) {
+        scrollToBottom();
+    } else {
+        chatContainer.scrollTop = scrollPos;
+    }
+
+    // Defer post-processing to next frame so HTML renders immediately
+    requestAnimationFrame(() => {
+        proxyLocalImages();
+        makeArtifactLinksClickable();
+        addMobileCopyButtons();
+    });
+}
+
+// --- Rendering (HTTP fallback for initial load) ---
 async function loadSnapshot() {
     try {
-        // Add spin animation to refresh button (no forced reflow)
         const icon = refreshBtn.querySelector('svg');
         icon.classList.add('spin-anim');
         setTimeout(() => icon.classList.remove('spin-anim'), 600);
@@ -313,7 +748,6 @@ async function loadSnapshot() {
         const response = await fetchWithAuth('/snapshot');
         if (!response.ok) {
             if (response.status === 503) {
-                // No snapshot available - likely no chat open
                 chatIsOpen = false;
                 showEmptyState();
                 return;
@@ -321,213 +755,8 @@ async function loadSnapshot() {
             throw new Error('Failed to load');
         }
 
-        // Mark chat as open since we got a valid snapshot
-        chatIsOpen = true;
-
         const data = await response.json();
-
-        // Capture scroll state BEFORE updating content
-        const scrollPos = chatContainer.scrollTop;
-        const scrollHeight = chatContainer.scrollHeight;
-        const clientHeight = chatContainer.clientHeight;
-        const isNearBottom = scrollHeight - scrollPos - clientHeight < 120;
-        const isUserScrollLocked = Date.now() < userScrollLockUntil;
-
-        // --- UPDATE STATS ---
-        if (data.stats) {
-            const kbs = Math.round((data.stats.htmlSize + data.stats.cssSize) / 1024);
-            const nodes = data.stats.nodes;
-            const statsText = document.getElementById('statsText');
-            if (statsText) statsText.textContent = `${nodes} Nodes · ${kbs}KB`;
-        }
-
-        // --- CSS INJECTION (Cached) ---
-        let styleTag = document.getElementById('cdp-styles');
-        if (!styleTag) {
-            styleTag = document.createElement('style');
-            styleTag.id = 'cdp-styles';
-            document.head.appendChild(styleTag);
-        }
-
-        const darkModeOverrides = '/* --- BASE SNAPSHOT CSS --- */\n' +
-            data.css +
-            '\n\n/* --- FORCE DARK MODE OVERRIDES --- */\n' +
-            ':root {\n' +
-            '    --bg-app: #0f172a;\n' +
-            '    --text-main: #f8fafc;\n' +
-            '    --text-muted: #94a3b8;\n' +
-            '    --border-color: #334155;\n' +
-            '}\n' +
-            '\n' +
-            '#conversation, #chat, #cascade {\n' +
-            '    background-color: transparent !important;\n' +
-            '    color: var(--text-main) !important;\n' +
-            '    font-family: \'Inter\', system-ui, sans-serif !important;\n' +
-            '    position: relative !important;\n' +
-            '    height: auto !important;\n' +
-            '    width: 100% !important;\n' +
-            '}\n' +
-            '\n' +
-            '#conversation *, #chat *, #cascade * {\n' +
-            '    position: static !important;\n' +
-            '}\n' +
-            '\n' +
-            '#conversation p, #chat p, #cascade p, #conversation h1, #chat h1, #cascade h1, #conversation h2, #chat h2, #cascade h2, #conversation h3, #chat h3, #cascade h3, #conversation h4, #chat h4, #cascade h4, #conversation h5, #chat h5, #cascade h5, #conversation span, #chat span, #cascade span, #conversation div, #chat div, #cascade div, #conversation li, #chat li, #cascade li {\n' +
-            '    color: inherit !important;\n' +
-            '}\n' +
-            '\n' +
-            '#conversation a, #chat a, #cascade a {\n' +
-            '    color: #60a5fa !important;\n' +
-            '    text-decoration: underline;\n' +
-            '}\n' +
-            '\n' +
-            '/* Fix Inline Code - Ultra-compact */\n' +
-            ':not(pre) > code {\n' +
-            '    padding: 0px 2px !important;\n' +
-            '    border-radius: 2px !important;\n' +
-            '    background-color: rgba(255, 255, 255, 0.1) !important;\n' +
-            '    font-size: 0.82em !important;\n' +
-            '    line-height: 1 !important;\n' +
-            '    white-space: normal !important;\n' +
-            '}\n' +
-            '\n' +
-            'pre, code, .monaco-editor-background, [class*="terminal"] {\n' +
-            '    background-color: #1e293b !important;\n' +
-            '    color: #e2e8f0 !important;\n' +
-            '    font-family: \'JetBrains Mono\', monospace !important;\n' +
-            '    border-radius: 3px;\n' +
-            '    border: 1px solid #334155;\n' +
-            '}\n' +
-            '                \n' +
-            '/* Multi-line Code Block - Minimal */\n' +
-            'pre {\n' +
-            '    position: relative !important;\n' +
-            '    white-space: pre-wrap !important; \n' +
-            '    word-break: break-word !important;\n' +
-            '    padding: 4px 6px !important;\n' +
-            '    margin: 2px 0 !important;\n' +
-            '    display: block !important;\n' +
-            '    width: 100% !important;\n' +
-            '}\n' +
-            '                \n' +
-            'pre.has-copy-btn {\n' +
-            '    padding-right: 28px !important;\n' +
-            '}\n' +
-            '                \n' +
-            '/* Single-line Code Block - Minimal */\n' +
-            'pre.single-line-pre {\n' +
-            '    display: inline-block !important;\n' +
-            '    width: auto !important;\n' +
-            '    max-width: 100% !important;\n' +
-            '    padding: 0px 4px !important;\n' +
-            '    margin: 0px !important;\n' +
-            '    vertical-align: middle !important;\n' +
-            '    background-color: #1e293b !important;\n' +
-            '    font-size: 0.85em !important;\n' +
-            '}\n' +
-            '                \n' +
-            'pre.single-line-pre > code {\n' +
-            '    display: inline !important;\n' +
-            '    white-space: nowrap !important;\n' +
-            '}\n' +
-            '                \n' +
-            'pre:not(.single-line-pre) > code {\n' +
-            '    display: block !important;\n' +
-            '    width: 100% !important;\n' +
-            '    overflow-x: auto !important;\n' +
-            '    background: transparent !important;\n' +
-            '    border: none !important;\n' +
-            '    padding: 0 !important;\n' +
-            '    margin: 0 !important;\n' +
-            '}\n' +
-            '                \n' +
-            '.mobile-copy-btn {\n' +
-            '    position: absolute !important;\n' +
-            '    top: 2px !important;\n' +
-            '    right: 2px !important;\n' +
-            '    background: rgba(30, 41, 59, 0.5) !important; /* Transparent bg */\n' +
-            '    color: #94a3b8 !important;\n' +
-            '    border: none !important;\n' +
-            '    width: 24px !important; \n' +
-            '    height: 24px !important;\n' +
-            '    padding: 0 !important;\n' +
-            '    cursor: pointer !important;\n' +
-            '    display: flex !important;\n' +
-            '    align-items: center !important;\n' +
-            '    justify-content: center !important;\n' +
-            '    border-radius: 4px !important;\n' +
-            '    transition: all 0.2s ease !important;\n' +
-            '    -webkit-tap-highlight-color: transparent !important;\n' +
-            '    z-index: 10 !important;\n' +
-            '    margin: 0 !important;\n' +
-            '}\n' +
-            '                \n' +
-            '.mobile-copy-btn:hover,\n' +
-            '.mobile-copy-btn:focus {\n' +
-            '    background: rgba(59, 130, 246, 0.2) !important;\n' +
-            '    color: #60a5fa !important;\n' +
-            '}\n' +
-            '                \n' +
-            '.mobile-copy-btn svg {\n' +
-            '    width: 16px !important;\n' +
-            '    height: 16px !important;\n' +
-            '    stroke: currentColor !important;\n' +
-            '    stroke-width: 2 !important;\n' +
-            '    fill: none !important;\n' +
-            '}\n' +
-            '                \n' +
-            'blockquote {\n' +
-            '    border-left: 3px solid #3b82f6 !important;\n' +
-            '    background: rgba(59, 130, 246, 0.1) !important;\n' +
-            '    color: #cbd5e1 !important;\n' +
-            '    padding: 8px 12px !important;\n' +
-            '    margin: 8px 0 !important;\n' +
-            '}\n' +
-            '\n' +
-            'table {\n' +
-            '    border-collapse: collapse !important;\n' +
-            '    width: 100% !important;\n' +
-            '    border: 1px solid #334155 !important;\n' +
-            '}\n' +
-            'th, td {\n' +
-            '    border: 1px solid #334155 !important;\n' +
-            '    padding: 8px !important;\n' +
-            '    color: #e2e8f0 !important;\n' +
-            '}\n' +
-            '\n' +
-            '::-webkit-scrollbar {\n' +
-            '    width: 0 !important;\n' +
-            '}\n' +
-            '                \n' +
-            '[style*=\"background-color: rgb(255, 255, 255)\"],\n' +
-            '[style*=\"background-color: white\"],\n' +
-            '[style*=\"background: white\"] {\n' +
-            '    background-color: transparent !important;\n' +
-            '}';
-        styleTag.textContent = darkModeOverrides;
-        chatContent.innerHTML = data.html;
-
-        // Make .md artifact links clickable to open in viewer
-        makeArtifactLinksClickable();
-
-        // Add mobile copy buttons to all code blocks
-        addMobileCopyButtons();
-
-        // Smart scroll behavior: respect user scroll, only auto-scroll when appropriate
-        if (isUserScrollLocked) {
-            // User recently scrolled - try to maintain their approximate position
-            // Use percentage-based restoration for better accuracy
-            const scrollPercent = scrollHeight > 0 ? scrollPos / scrollHeight : 0;
-            const newScrollPos = chatContainer.scrollHeight * scrollPercent;
-            chatContainer.scrollTop = newScrollPos;
-        } else if (isNearBottom || scrollPos === 0) {
-            // User was at bottom or hasn't scrolled - auto scroll to bottom
-            scrollToBottom();
-        } else {
-            // Preserve exact scroll position
-            chatContainer.scrollTop = scrollPos;
-        }
-
+        applySnapshot(data);
     } catch (err) {
         console.error(err);
     }
@@ -697,6 +926,11 @@ async function sendMessage() {
     const message = messageInput.value.trim();
     const images = [...pendingImages];
     if (!message && images.length === 0) return;
+    if (isSending) return; // Guard: prevent duplicate sends
+    isSending = true;
+
+    // Track message for history (before clearing)
+    if (message) trackMessage(message);
 
     // Optimistic UI updates
     messageInput.value = ''; // Clear immediately
@@ -764,13 +998,48 @@ async function sendMessage() {
         console.error('Send error:', e);
         setTimeout(loadSnapshot, 500);
     } finally {
+        isSending = false;
         sendBtn.disabled = false;
         sendBtn.style.opacity = '1';
     }
 }
 
 // --- Event Listeners ---
-sendBtn.addEventListener('click', sendMessage);
+// Two-tap confirm to prevent accidental sends
+let sendConfirmPending = false;
+let sendConfirmTimer = null;
+const SEND_CONFIRM_TIMEOUT = 3000; // 3 seconds to confirm
+
+sendBtn.addEventListener('click', () => {
+    if (isSending) return;
+    const message = messageInput.value.trim();
+    const images = [...pendingImages];
+    if (!message && images.length === 0) return;
+
+    if (!sendConfirmPending) {
+        // First tap: show confirmation state
+        sendConfirmPending = true;
+        sendBtn.style.background = '#f59e0b'; // amber/orange
+        sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+        sendBtn.setAttribute('aria-label', 'Confirm send');
+
+        sendConfirmTimer = setTimeout(() => {
+            // Reset if not confirmed within timeout
+            sendConfirmPending = false;
+            sendBtn.style.background = '';
+            sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
+            sendBtn.setAttribute('aria-label', 'Send');
+        }, SEND_CONFIRM_TIMEOUT);
+    } else {
+        // Second tap: confirm and send
+        clearTimeout(sendConfirmTimer);
+        sendConfirmPending = false;
+        sendBtn.style.background = '';
+        sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
+        sendBtn.setAttribute('aria-label', 'Send');
+        sendMessage();
+    }
+});
 
 refreshBtn.addEventListener('click', () => {
     // Refresh both Chat and State (Mode/Model)
@@ -854,13 +1123,252 @@ scrollToBottomBtn.addEventListener('click', () => {
     scrollToBottom();
 });
 
-// --- Quick Actions ---
+// --- Quick Actions + Message History (Per-Project) ---
+
+const DEFAULT_QUICK_ACTIONS = [
+    { emoji: '▶', label: 'Continue', text: 'Continue' },
+    { emoji: '🐛', label: 'Fix Bugs', text: 'Please fix the bugs in this file.' },
+    { emoji: '📝', label: 'Docs', text: 'Please create documentation for this.' }
+];
+
+const MAX_HISTORY = 20;
+let chipLongPressTimer = null;
+let chipEditorIndex = -1; // -1 = new chip
+
+function getProjectKey() {
+    const win = currentWindows.find(w => w.id === currentActiveWindowId);
+    return win?.projectName || win?.title || 'default';
+}
+
+function loadQuickActions() {
+    const key = `quickActions:${getProjectKey()}`;
+    try {
+        const saved = localStorage.getItem(key);
+        if (saved) return JSON.parse(saved);
+    } catch (e) { }
+    return [...DEFAULT_QUICK_ACTIONS];
+}
+
+function saveQuickActions(actions) {
+    const key = `quickActions:${getProjectKey()}`;
+    localStorage.setItem(key, JSON.stringify(actions));
+}
+
+function loadMsgHistory() {
+    const key = `msgHistory:${getProjectKey()}`;
+    try {
+        const saved = localStorage.getItem(key);
+        if (saved) return JSON.parse(saved);
+    } catch (e) { }
+    return [];
+}
+
+function saveMsgHistory(history) {
+    const key = `msgHistory:${getProjectKey()}`;
+    localStorage.setItem(key, JSON.stringify(history));
+}
+
+function trackMessage(text) {
+    if (!text || text.length < 2) return;
+    const history = loadMsgHistory();
+    const existing = history.find(h => h.text === text);
+    if (existing) {
+        existing.count++;
+        existing.lastUsed = Date.now();
+    } else {
+        history.push({ text, count: 1, lastUsed: Date.now() });
+    }
+    // Sort by frequency, keep max
+    history.sort((a, b) => b.count - a.count);
+    if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
+    saveMsgHistory(history);
+}
+
 function quickAction(text) {
     messageInput.value = text;
     messageInput.style.height = 'auto';
     messageInput.style.height = messageInput.scrollHeight + 'px';
     messageInput.focus();
 }
+
+function renderQuickActions() {
+    const bar = document.getElementById('quickActionsBar');
+    if (!bar) return;
+    bar.innerHTML = '';
+
+    const actions = loadQuickActions();
+
+    // Render pinned chips
+    actions.forEach((action, index) => {
+        const chip = document.createElement('div');
+        chip.className = 'action-chip';
+        chip.textContent = `${action.emoji} ${action.label}`;
+
+        // Tap = fill input
+        chip.addEventListener('click', (e) => {
+            if (chipLongPressTimer) return; // ignore if was long-pressing
+            quickAction(action.text);
+        });
+
+        // Long-press = edit
+        chip.addEventListener('touchstart', (e) => {
+            chip.classList.add('holding');
+            chipLongPressTimer = setTimeout(() => {
+                chipLongPressTimer = null;
+                chip.classList.remove('holding');
+                openChipEditor(index, action);
+            }, 500);
+        }, { passive: true });
+
+        chip.addEventListener('touchend', () => {
+            chip.classList.remove('holding');
+            if (chipLongPressTimer) {
+                clearTimeout(chipLongPressTimer);
+                chipLongPressTimer = null;
+            }
+        });
+
+        chip.addEventListener('touchmove', () => {
+            chip.classList.remove('holding');
+            if (chipLongPressTimer) {
+                clearTimeout(chipLongPressTimer);
+                chipLongPressTimer = null;
+            }
+        });
+
+        bar.appendChild(chip);
+    });
+
+    // Recent messages chip
+    const history = loadMsgHistory();
+    if (history.length > 0) {
+        const recentChip = document.createElement('div');
+        recentChip.className = 'action-chip recent-chip';
+        recentChip.textContent = `📋 Recientes`;
+        recentChip.addEventListener('click', showRecentPicker);
+        bar.appendChild(recentChip);
+    }
+
+    // Workflows chip
+    const wfChip = document.createElement('div');
+    wfChip.className = 'action-chip workflow-chip';
+    wfChip.textContent = '⚡ Workflows';
+    wfChip.addEventListener('click', showWorkflowPicker);
+    bar.appendChild(wfChip);
+
+    // Add new chip button
+    if (actions.length < 6) {
+        const addChip = document.createElement('div');
+        addChip.className = 'action-chip add-chip';
+        addChip.textContent = '+';
+        addChip.addEventListener('click', () => openChipEditor(-1, null));
+        bar.appendChild(addChip);
+    }
+}
+
+// --- Chip Editor ---
+function openChipEditor(index, action) {
+    chipEditorIndex = index;
+    const overlay = document.getElementById('chipEditorOverlay');
+    const titleEl = document.getElementById('chipEditorTitle');
+    const emojiInput = document.getElementById('chipEditorEmoji');
+    const labelInput = document.getElementById('chipEditorLabel');
+    const textInput = document.getElementById('chipEditorText');
+    const deleteBtn = document.getElementById('chipEditorDelete');
+
+    if (action) {
+        titleEl.textContent = 'Edit Quick Action';
+        emojiInput.value = action.emoji;
+        labelInput.value = action.label;
+        textInput.value = action.text;
+        deleteBtn.style.display = '';
+    } else {
+        titleEl.textContent = 'New Quick Action';
+        emojiInput.value = '';
+        labelInput.value = '';
+        textInput.value = '';
+        deleteBtn.style.display = 'none';
+    }
+
+    overlay.style.display = 'flex';
+    setTimeout(() => labelInput.focus(), 100);
+}
+
+function closeChipEditor() {
+    document.getElementById('chipEditorOverlay').style.display = 'none';
+}
+
+// Editor event listeners
+document.getElementById('chipEditorSave').addEventListener('click', () => {
+    const emoji = document.getElementById('chipEditorEmoji').value.trim() || '⚡';
+    const label = document.getElementById('chipEditorLabel').value.trim();
+    const text = document.getElementById('chipEditorText').value.trim();
+    if (!label || !text) return;
+
+    const actions = loadQuickActions();
+    const newAction = { emoji, label, text };
+
+    if (chipEditorIndex >= 0 && chipEditorIndex < actions.length) {
+        actions[chipEditorIndex] = newAction;
+    } else {
+        actions.push(newAction);
+    }
+
+    saveQuickActions(actions);
+    closeChipEditor();
+    renderQuickActions();
+});
+
+document.getElementById('chipEditorDelete').addEventListener('click', () => {
+    if (chipEditorIndex < 0) return;
+    const actions = loadQuickActions();
+    actions.splice(chipEditorIndex, 1);
+    saveQuickActions(actions);
+    closeChipEditor();
+    renderQuickActions();
+});
+
+document.getElementById('chipEditorCancel').addEventListener('click', closeChipEditor);
+document.getElementById('chipEditorOverlay').addEventListener('click', (e) => {
+    if (e.target.id === 'chipEditorOverlay') closeChipEditor();
+});
+
+// --- Recent Messages Picker ---
+function showRecentPicker() {
+    const picker = document.getElementById('recentPicker');
+    const list = document.getElementById('recentList');
+    const history = loadMsgHistory();
+
+    list.innerHTML = '';
+    if (history.length === 0) {
+        list.innerHTML = '<div class="recent-empty">No recent messages yet</div>';
+    } else {
+        history.forEach(item => {
+            const row = document.createElement('div');
+            row.className = 'recent-item';
+            row.innerHTML = `
+                <span class="recent-item-text">${escapeHtml(item.text)}</span>
+                <span class="recent-item-count">×${item.count}</span>
+            `;
+            row.addEventListener('click', () => {
+                quickAction(item.text);
+                hideRecentPicker();
+            });
+            list.appendChild(row);
+        });
+    }
+
+    picker.style.display = 'flex';
+}
+
+function hideRecentPicker() {
+    document.getElementById('recentPicker').style.display = 'none';
+}
+
+
+
+
+// Quick actions are rendered after fetchWindows() loads the correct project key
 
 // --- Stop Logic ---
 stopBtn.addEventListener('click', async () => {
@@ -961,16 +1469,12 @@ async function showChatHistory() {
                 let html = '';
                 data.chats.forEach(chat => {
                     const safeTitle = escapeHtml(chat.title);
-                    const isPinned = pinnedTabs.some(t => t.title === chat.title);
                     html += `
                         <div class="history-item" style="gap: 8px;">
                             <div style="flex: 1; min-width: 0; cursor: pointer;" onclick="selectChat('${safeTitle.replace(/'/g, "\\\\'")}'); hideChatHistory();">
                                 <div style="font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${safeTitle}</div>
                                 <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${escapeHtml(chat.date || '')}</div>
                             </div>
-                            <button class="pin-btn ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation(); togglePinTab('${safeTitle.replace(/'/g, "\\\'")}'); this.classList.toggle('pinned');" title="${isPinned ? 'Unpin' : 'Pin to tabs'}">
-                                ${isPinned ? '⭐' : '📌'}
-                            </button>
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.4; flex-shrink: 0; cursor: pointer;" onclick="selectChat('${safeTitle.replace(/'/g, "\\\'")}'); hideChatHistory();">
                                 <polyline points="9 18 15 12 9 6"></polyline>
                             </svg>
@@ -1350,7 +1854,7 @@ async function showFilesView(dir = '') {
                             <span style="font-size: 20px;">📁</span>
                             <div>
                                 <div style="font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(shortName)}</div>
-                                <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${d.mdCount} file${d.mdCount !== 1 ? 's' : ''}</div>
+                                <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${d.fileCount} file${d.fileCount !== 1 ? 's' : ''}</div>
                             </div>
                         </div>
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.4; flex-shrink: 0;">
@@ -1361,31 +1865,53 @@ async function showFilesView(dir = '') {
             }
         }
 
-        // Show files
+        // Show files (markdown + images)
         if (data.files && data.files.length > 0) {
             for (const f of data.files) {
                 const filePath = dir ? `${dir}/${f.name}` : f.name;
                 const sizeKb = (f.size / 1024).toFixed(1);
                 const modDate = new Date(f.modified).toLocaleDateString();
-                html += `
-                    <div class="history-item" onclick="openMarkdownFile('${escapeHtml(filePath)}')">
-                        <div style="flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;">
-                            <span style="font-size: 20px;">📄</span>
-                            <div>
-                                <div style="font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(f.name)}</div>
-                                <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${sizeKb} KB · ${modDate}</div>
+                
+                if (f.type === 'image') {
+                    // Image file — show thumbnail with tap to view full
+                    const imgSrc = `/api/serve-image?path=${encodeURIComponent(f.absolutePath)}`;
+                    html += `
+                        <div class="history-item" onclick="showImageFullscreen('${escapeHtml(f.absolutePath)}', '${escapeHtml(f.name)}')" style="min-height: 60px;">
+                            <div style="flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;">
+                                <img src="${imgSrc}" style="width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: rgba(255,255,255,0.05);" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                                <span style="font-size: 20px; display: none; width: 44px; height: 44px; align-items: center; justify-content: center;">🖼️</span>
+                                <div>
+                                    <div style="font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(f.name)}</div>
+                                    <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${sizeKb} KB · ${modDate}</div>
+                                </div>
                             </div>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.4; flex-shrink: 0;">
+                                <polyline points="9 18 15 12 9 6"></polyline>
+                            </svg>
                         </div>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.4; flex-shrink: 0;">
-                            <polyline points="9 18 15 12 9 6"></polyline>
-                        </svg>
-                    </div>
-                `;
+                    `;
+                } else {
+                    // Markdown file
+                    html += `
+                        <div class="history-item" onclick="openMarkdownFile('${escapeHtml(filePath)}')">
+                            <div style="flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;">
+                                <span style="font-size: 20px;">📄</span>
+                                <div>
+                                    <div style="font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(f.name)}</div>
+                                    <div style="font-size: 12px; color: #94a3b8; margin-top: 2px;">${sizeKb} KB · ${modDate}</div>
+                                </div>
+                            </div>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.4; flex-shrink: 0;">
+                                <polyline points="9 18 15 12 9 6"></polyline>
+                            </svg>
+                        </div>
+                    `;
+                }
             }
         }
 
         if (!html) {
-            html = `<div style="padding: 40px 20px; text-align: center; color: white; opacity: 0.7;">No markdown files found</div>`;
+            html = `<div style="padding: 40px 20px; text-align: center; color: white; opacity: 0.7;">No files found</div>`;
         }
 
         filesContent.innerHTML = html;
@@ -1400,6 +1926,7 @@ async function openMarkdownFile(filePath) {
     filesNavStack.push(filesCurrentDir);
     const fileName = filePath.split(/[\\/]/).pop();
     filesTitle.textContent = fileName;
+    filesLayer.classList.add('show');
 
     filesContent.innerHTML = `
         <div style="padding: 40px 20px; text-align: center; color: white;">
@@ -1425,6 +1952,34 @@ async function openMarkdownFile(filePath) {
     }
 }
 
+function showImageFullscreen(absolutePath, fileName) {
+    const imgSrc = `/api/serve-image?path=${encodeURIComponent(absolutePath)}`;
+    
+    // Create fullscreen overlay
+    const overlay = document.createElement('div');
+    overlay.id = 'imageFullscreenOverlay';
+    overlay.style.cssText = `
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.95); z-index: 10001;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+    `;
+    
+    overlay.innerHTML = `
+        <div style="position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);">
+            <span style="color: #f8fafc; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; margin-right: 8px;">${escapeHtml(fileName)}</span>
+            <button onclick="document.getElementById('imageFullscreenOverlay').remove()" style="background: rgba(255,255,255,0.15); border: none; border-radius: 50%; width: 36px; height: 36px; color: white; font-size: 18px; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">✕</button>
+        </div>
+        <img src="${imgSrc}" style="max-width: 95%; max-height: 80vh; object-fit: contain; border-radius: 8px; touch-action: pinch-zoom;" alt="${escapeHtml(fileName)}">
+    `;
+    
+    // Tap background to close
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+    });
+    
+    document.body.appendChild(overlay);
+}
+
 function hideFilesView() {
     filesLayer.classList.remove('show');
     filesNavStack = [];
@@ -1438,12 +1993,246 @@ filesBtn.addEventListener('click', () => {
 
 filesBackBtn.addEventListener('click', () => {
     if (filesNavStack.length > 0) {
-        const prevDir = filesNavStack.pop();
-        showFilesView(prevDir);
+        const prev = filesNavStack.pop();
+        if (prev === '__projects_root__') {
+            // Back to projects list
+            showProjectsBrowser();
+            filesNavStack = []; // reset since showProjectsBrowser sets its own stack
+        } else if (prev.startsWith('__project__')) {
+            // Back to a project subdirectory: __project__<name>__<subdir>
+            const parts = prev.split('__');
+            const project = parts[2] || '';
+            const subdir = parts.slice(3).join('__') || '';
+            browseProjectDir(project, subdir);
+        } else {
+            showFilesView(prev);
+        }
     } else {
         hideFilesView();
     }
 });
+
+// --- Projects Browser ---
+let projectsBrowsingProject = ''; // tracks which project we're browsing into
+
+async function showProjectsBrowser() {
+    projectsBrowsingProject = '';
+    filesLayer.classList.add('show');
+    filesTitle.textContent = 'Proyectos';
+    filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: white;"><div class="loading-spinner"></div><p>Loading projects...</p></div>`;
+    filesNavStack = ['__projects_root__'];
+
+    try {
+        const res = await fetchWithAuth('/api/projects');
+        if (!res.ok) throw new Error('Failed to fetch projects');
+        const data = await res.json();
+
+        // --- Action buttons bar ---
+        let actionsHtml = `<div style="display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.1);">`;
+
+        // Button 1: Open/Switch to proyects folder in Antigravity
+        const proyectsWindow = (currentWindows || []).find(w =>
+            w.projectName === 'proyects' || w.projectName === 'Proyects'
+        );
+        if (proyectsWindow) {
+            actionsHtml += `<button id="btnOpenProyects" style="flex:1;padding:10px 12px;border:none;border-radius:8px;background:rgba(74,222,128,0.2);color:#4ade80;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+                <span style="font-size:14px;">⚡</span> Ir a Proyects
+            </button>`;
+        } else {
+            actionsHtml += `<button id="btnOpenProyects" style="flex:1;padding:10px 12px;border:none;border-radius:8px;background:rgba(59,130,246,0.2);color:#60a5fa;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+                <span style="font-size:14px;">⚡</span> Abrir en AG
+            </button>`;
+        }
+
+        // Button 2: Create new folder
+        actionsHtml += `<button id="btnCreateFolder" style="flex:1;padding:10px 12px;border:none;border-radius:8px;background:rgba(251,191,36,0.2);color:#fbbf24;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+            <span style="font-size:14px;">➕</span> Nueva Carpeta
+        </button>`;
+        actionsHtml += `</div>`;
+
+        // --- Project list ---
+        let listHtml = '';
+        if (!data.projects || data.projects.length === 0) {
+            listHtml = `<div style="padding: 40px 20px; text-align: center; color: rgba(255,255,255,0.5);">No projects found</div>`;
+        } else {
+            listHtml = data.projects.map(p => {
+                const ago = timeAgo(p.mtime);
+                const isOpen = (currentWindows || []).some(w =>
+                    w.projectName?.toLowerCase().includes(p.name.toLowerCase()) ||
+                    p.name.toLowerCase().includes(w.projectName?.toLowerCase() || '')
+                );
+                const statusDot = isOpen ? '<span style="color:#4ade80;margin-left:6px;">●</span>' : '';
+                return `<div class="files-dir-item" data-project="${escapeHtml(p.name)}" style="cursor:pointer;">
+                    <div class="files-dir-icon">📂</div>
+                    <div class="files-dir-info">
+                        <div class="files-dir-name">${escapeHtml(p.name)}${statusDot}</div>
+                        <div class="files-dir-meta">${ago}</div>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        filesContent.innerHTML = actionsHtml + listHtml;
+
+        // --- Attach event handlers ---
+
+        // Button: Open/Switch to proyects
+        const btnOpen = document.getElementById('btnOpenProyects');
+        if (btnOpen) {
+            btnOpen.addEventListener('click', () => {
+                if (proyectsWindow) {
+                    // Switch to existing window
+                    filesLayer.classList.remove('show');
+                    switchWindow(proyectsWindow.id);
+                } else {
+                    // Open new Antigravity instance in proyects folder
+                    const basePath = data.basePath || '';
+                    if (basePath) {
+                        openWorkspace(basePath);
+                        btnOpen.innerHTML = '<span style="font-size:14px;">⏳</span> Abriendo...';
+                        btnOpen.style.opacity = '0.5';
+                        btnOpen.disabled = true;
+                    }
+                }
+            });
+        }
+
+        // Button: Create new folder
+        const btnCreate = document.getElementById('btnCreateFolder');
+        if (btnCreate) {
+            btnCreate.addEventListener('click', async () => {
+                const folderName = prompt('Nombre de la nueva carpeta:');
+                if (!folderName || !folderName.trim()) return;
+
+                try {
+                    const createRes = await fetchWithAuth('/api/create-project-folder', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: folderName.trim() })
+                    });
+                    const result = await createRes.json();
+                    if (createRes.ok && result.success) {
+                        // Refresh the projects list
+                        showProjectsBrowser();
+                    } else {
+                        alert(result.error || 'Error al crear carpeta');
+                    }
+                } catch (err) {
+                    alert('Error: ' + err.message);
+                }
+            });
+        }
+
+        // Click handler: browse into the project directory
+        filesContent.querySelectorAll('.files-dir-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const projName = item.dataset.project;
+                filesNavStack.push('__projects_root__');
+                browseProjectDir(projName, '');
+            });
+        });
+    } catch (e) {
+        filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: #ff6b6b;">Error: ${e.message}</div>`;
+    }
+}
+
+async function browseProjectDir(project, subdir) {
+    projectsBrowsingProject = project;
+    filesTitle.textContent = subdir ? subdir.split('/').pop() : project;
+    filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: white;"><div class="loading-spinner"></div></div>`;
+
+    try {
+        const res = await fetchWithAuth(`/api/project-files?project=${encodeURIComponent(project)}&dir=${encodeURIComponent(subdir)}`);
+        if (!res.ok) throw new Error('Failed');
+        const data = await res.json();
+
+        let html = '';
+
+        // Directories
+        for (const d of data.dirs) {
+            html += `<div class="files-dir-item" data-subdir="${escapeHtml(subdir ? subdir + '/' + d.name : d.name)}" style="cursor:pointer;">
+                <div class="files-dir-icon">📁</div>
+                <div class="files-dir-info">
+                    <div class="files-dir-name">${escapeHtml(d.name)}</div>
+                    <div class="files-dir-meta">${d.fileCount} items</div>
+                </div>
+            </div>`;
+        }
+
+        // Files
+        for (const f of data.files) {
+            const icon = f.type === 'markdown' ? '📄' : '📝';
+            const sizeStr = f.size > 1024 ? `${(f.size / 1024).toFixed(1)}KB` : `${f.size}B`;
+            const filePath = subdir ? `${project}/${subdir}/${f.name}` : `${project}/${f.name}`;
+            html += `<div class="files-file-item" data-filepath="${escapeHtml(filePath)}" style="cursor:pointer;">
+                <div class="files-dir-icon">${icon}</div>
+                <div class="files-dir-info">
+                    <div class="files-dir-name">${escapeHtml(f.name)}</div>
+                    <div class="files-dir-meta">${sizeStr}</div>
+                </div>
+            </div>`;
+        }
+
+        if (!html) {
+            html = `<div style="padding: 40px 20px; text-align: center; color: rgba(255,255,255,0.4);">Empty directory</div>`;
+        }
+
+        filesContent.innerHTML = html;
+
+        // Dir click → navigate deeper
+        filesContent.querySelectorAll('.files-dir-item').forEach(item => {
+            item.addEventListener('click', () => {
+                filesNavStack.push(`__project__${project}__${subdir}`);
+                browseProjectDir(project, item.dataset.subdir);
+            });
+        });
+
+        // File click → view content
+        filesContent.querySelectorAll('.files-file-item').forEach(item => {
+            item.addEventListener('click', () => {
+                filesNavStack.push(`__project__${project}__${subdir}`);
+                viewProjectFile(item.dataset.filepath);
+            });
+        });
+    } catch (e) {
+        filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: #ff6b6b;">Error loading files</div>`;
+    }
+}
+
+async function viewProjectFile(filePath) {
+    const fileName = filePath.split('/').pop();
+    filesTitle.textContent = fileName;
+    filesViewingFile = true;
+    filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: white;"><div class="loading-spinner"></div></div>`;
+
+    try {
+        const res = await fetchWithAuth(`/api/project-file-content?path=${encodeURIComponent(filePath)}`);
+        if (!res.ok) throw new Error('Failed to load file');
+        const data = await res.json();
+
+        if (data.type === 'markdown') {
+            filesContent.innerHTML = `<div class="md-container">${renderMarkdown(data.content)}</div>`;
+        } else {
+            // Code file — show with syntax highlighting style
+            const escaped = data.content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            filesContent.innerHTML = `<pre style="padding:16px;font-size:12px;line-height:1.5;color:#e2e8f0;overflow-x:auto;white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.3);border-radius:8px;margin:8px;">${escaped}</pre>`;
+        }
+    } catch (e) {
+        filesContent.innerHTML = `<div style="padding: 40px 20px; text-align: center; color: #ff6b6b;">Error: ${e.message}</div>`;
+    }
+}
+
+function timeAgo(ms) {
+    if (!ms) return '';
+    const seconds = Math.floor((Date.now() - ms) / 1000);
+    if (seconds < 60) return 'just now';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+}
 
 // --- Init ---
 connectWebSocket();
@@ -1455,11 +2244,110 @@ setInterval(fetchAppState, 5000);
 checkChatStatus();
 setInterval(checkChatStatus, 10000); // Check every 10 seconds
 
-// ===== WINDOW SWITCHER (Multi-Window Support) =====
-const windowSwitcher = document.getElementById('windowSwitcher');
-const windowSwitcherInner = document.getElementById('windowSwitcherInner');
-let currentWindows = [];
-let currentActiveWindowId = null;
+// ===== SIDE PANEL (Window Switcher as Drawer) =====
+const sidePanel = document.getElementById('sidePanel');
+const sidePanelOverlay = document.getElementById('sidePanelOverlay');
+const sidePanelList = document.getElementById('sidePanelList');
+const sidePanelClose = document.getElementById('sidePanelClose');
+const menuBtn = document.getElementById('menuBtn');
+// currentWindows and currentActiveWindowId moved to top State section
+
+function openSidePanel() {
+    sidePanel.classList.add('open');
+    sidePanelOverlay.classList.add('open');
+    document.body.style.overflow = 'hidden';
+}
+
+function closeSidePanel() {
+    sidePanel.classList.remove('open');
+    sidePanelOverlay.classList.remove('open');
+    document.body.style.overflow = '';
+}
+
+function toggleSidePanel() {
+    if (sidePanel.classList.contains('open')) {
+        closeSidePanel();
+    } else {
+        openSidePanel();
+    }
+}
+
+// Button handlers
+menuBtn.addEventListener('click', toggleSidePanel);
+sidePanelOverlay.addEventListener('click', closeSidePanel);
+sidePanelClose.addEventListener('click', closeSidePanel);
+
+// ===== OVERFLOW MENU (⋯ More Options) =====
+const overflowBtn = document.getElementById('overflowBtn');
+const overflowMenu = document.getElementById('overflowMenu');
+const overflowOverlay = document.getElementById('overflowOverlay');
+
+function openOverflowMenu() {
+    overflowMenu.classList.add('open');
+    overflowOverlay.classList.add('open');
+}
+
+function closeOverflowMenu() {
+    overflowMenu.classList.remove('open');
+    overflowOverlay.classList.remove('open');
+}
+
+function toggleOverflowMenu() {
+    if (overflowMenu.classList.contains('open')) {
+        closeOverflowMenu();
+    } else {
+        openOverflowMenu();
+    }
+}
+
+overflowBtn.addEventListener('click', toggleOverflowMenu);
+overflowOverlay.addEventListener('click', closeOverflowMenu);
+
+// Auto-close overflow when any item is clicked
+overflowMenu.querySelectorAll('.overflow-item').forEach(item => {
+    item.addEventListener('click', () => {
+        setTimeout(closeOverflowMenu, 150);
+    });
+});
+
+// Swipe gesture: swipe from left edge to open, swipe left to close
+let touchStartX = 0;
+let touchStartY = 0;
+let swipeTracking = false;
+
+document.addEventListener('touchstart', (e) => {
+    const touch = e.touches[0];
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+    // Track swipe only from left edge (within 20px) to open, or if panel is open
+    swipeTracking = touchStartX < 20 || sidePanel.classList.contains('open');
+}, { passive: true });
+
+document.addEventListener('touchend', (e) => {
+    if (!swipeTracking) return;
+    const touch = e.changedTouches[0];
+    const deltaX = touch.clientX - touchStartX;
+    const deltaY = Math.abs(touch.clientY - touchStartY);
+    
+    // Only if horizontal swipe (more X than Y) and sufficient distance
+    if (Math.abs(deltaX) > 50 && deltaX > deltaY) {
+        if (deltaX > 0 && !sidePanel.classList.contains('open') && touchStartX < 20) {
+            // Swipe right from edge → open
+            openSidePanel();
+        } else if (deltaX < 0 && sidePanel.classList.contains('open')) {
+            // Swipe left → close
+            closeSidePanel();
+        }
+    }
+    swipeTracking = false;
+}, { passive: true });
+
+function updateProjectNameBar() {
+    const el = document.getElementById('projectName');
+    if (!el) return;
+    const active = (currentWindows || []).find(w => w.id === currentActiveWindowId);
+    el.textContent = active ? active.projectName : '';
+}
 
 async function fetchWindows() {
     try {
@@ -1468,7 +2356,9 @@ async function fetchWindows() {
         const data = await res.json();
         currentWindows = data.windows || [];
         currentActiveWindowId = data.activeWindowId;
+        updateProjectNameBar();
         renderWindows();
+        renderQuickActions(); // Render after windows load so project key is correct
     } catch (e) { /* silent */ }
 }
 
@@ -1479,7 +2369,6 @@ function getOrderedWindows() {
     const projects = currentWindows.filter(w => !w.isManager);
 
     if (savedOrder.length > 0) {
-        // Sort projects by saved order, unknown items go to end
         projects.sort((a, b) => {
             const ai = savedOrder.indexOf(a.id);
             const bi = savedOrder.indexOf(b.id);
@@ -1497,127 +2386,129 @@ function saveWindowOrder() {
     localStorage.setItem('ag_window_order', JSON.stringify(order));
 }
 
-function moveWindowTab(windowId, direction) {
-    const projects = currentWindows.filter(w => !w.isManager);
-    const idx = projects.findIndex(w => w.id === windowId);
-    if (idx === -1) return;
-
-    if (direction === 'left' && idx > 0) {
-        [projects[idx], projects[idx - 1]] = [projects[idx - 1], projects[idx]];
-    } else if (direction === 'right' && idx < projects.length - 1) {
-        [projects[idx], projects[idx + 1]] = [projects[idx + 1], projects[idx]];
-    } else if (direction === 'first') {
-        const item = projects.splice(idx, 1)[0];
-        projects.unshift(item);
-    }
-
-    // Save new order
-    localStorage.setItem('ag_window_order', JSON.stringify(projects.map(w => w.id)));
-    renderWindows();
-}
-
-let longPressTimer = null;
-
+let isClosingWindow = false;
 function renderWindows() {
-    // Only show switcher if more than 1 window
+    // Hide menu button if only 1 window
     if (currentWindows.length <= 1) {
-        windowSwitcher.style.display = 'none';
+        menuBtn.style.display = 'none';
         return;
     }
-    windowSwitcher.style.display = 'flex';
+    menuBtn.style.display = 'flex';
     const ordered = getOrderedWindows();
-    windowSwitcherInner.innerHTML = ordered.map(win => {
+    sidePanelList.innerHTML = ordered.map(win => {
         const isActive = win.id === currentActiveWindowId;
         const managerClass = win.isManager ? ' manager' : '';
-        return `<div class="window-tab${managerClass}${isActive ? ' active' : ''}" 
-            data-window-id="${win.id}" data-is-manager="${win.isManager}">
-            <span class="window-dot"></span>
-            <span>${escapeHtml(win.projectName)}</span>
+        const closeBtn = win.isManager ? '' : `<button class="side-panel-close-item" data-close-id="${win.id}" data-close-name="${escapeHtml(win.projectName)}" aria-label="Close window" title="Close">✕</button>`;
+        return `<div class="side-panel-item${managerClass}${isActive ? ' active' : ''}" 
+            data-window-id="${win.id}" data-is-manager="${win.isManager}"
+            title="${escapeHtml(win.projectName)}">
+            <span class="side-panel-dot"></span>
+            <span class="side-panel-item-label">${escapeHtml(win.projectName)}</span>
+            ${closeBtn}
         </div>`;
     }).join('');
 
-    // Add tap + long-press handlers
-    windowSwitcherInner.querySelectorAll('.window-tab').forEach(tab => {
-        const winId = tab.dataset.windowId;
-        const isManager = tab.dataset.isManager === 'true';
-
-        tab.addEventListener('click', () => switchWindow(winId));
-
-        // Long-press for reorder (only on project tabs, not Manager)
-        if (!isManager) {
-            tab.addEventListener('touchstart', (e) => {
-                longPressTimer = setTimeout(() => {
-                    e.preventDefault();
-                    showReorderMenu(winId, tab);
-                }, 500);
-            }, { passive: false });
-            tab.addEventListener('touchend', () => clearTimeout(longPressTimer));
-            tab.addEventListener('touchmove', () => clearTimeout(longPressTimer));
-        }
+    // Add click handlers (switch window) — with closing guard
+    sidePanelList.querySelectorAll('.side-panel-item').forEach(item => {
+        const winId = item.dataset.windowId;
+        item.addEventListener('click', (e) => {
+            // Don't switch if they tapped the close button or a close is in progress
+            if (e.target.closest('.side-panel-close-item')) return;
+            if (isClosingWindow) return;
+            switchWindow(winId);
+        });
     });
+
+    // Add close button handlers (mobile-safe)
+    sidePanelList.querySelectorAll('.side-panel-close-item').forEach(btn => {
+        // Touch handler for mobile
+        btn.addEventListener('touchstart', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            if (isClosingWindow) return;
+            isClosingWindow = true;
+            const winId = btn.dataset.closeId;
+            console.log('🗑️ Close tapped (touch):', winId);
+            closeWindowById(winId);
+            setTimeout(() => { isClosingWindow = false; }, 2000);
+        }, { passive: false });
+        
+        // Click handler for desktop
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            if (isClosingWindow) return;
+            isClosingWindow = true;
+            const winId = btn.dataset.closeId;
+            console.log('🗑️ Close clicked:', winId);
+            closeWindowById(winId);
+            setTimeout(() => { isClosingWindow = false; }, 2000);
+        });
+    });
+
+    // Add "📂 Proyectos" shortcut at the bottom of the window list
+    const projectsShortcut = document.createElement('div');
+    projectsShortcut.className = 'side-panel-item projects-shortcut';
+    projectsShortcut.innerHTML = `<span style="font-size: 16px; margin-right: 8px;">📂</span><span class="side-panel-item-label">Proyectos</span>`;
+    projectsShortcut.style.cssText = 'margin-top: 12px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 12px; opacity: 0.7;';
+    projectsShortcut.addEventListener('click', () => {
+        closeSidePanel();
+        showProjectsBrowser();
+    });
+    sidePanelList.appendChild(projectsShortcut);
 
     // Show/hide workspace opener based on whether Manager is active
     if (typeof updateManagerUI === 'function') updateManagerUI();
 }
 
-function showReorderMenu(windowId, tabEl) {
-    // Remove existing menu if any
-    document.querySelectorAll('.reorder-menu').forEach(m => m.remove());
-
-    const menu = document.createElement('div');
-    menu.className = 'reorder-menu';
-    menu.style.cssText = `
-        position: fixed; z-index: 9999; 
-        background: #1e293b; border: 1px solid #334155; border-radius: 8px;
-        padding: 4px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-        display: flex; gap: 2px;
-    `;
-
-    const rect = tabEl.getBoundingClientRect();
-    menu.style.left = rect.left + 'px';
-    menu.style.top = (rect.bottom + 4) + 'px';
-
-    const actions = [
-        { label: '⬅️', action: 'left' },
-        { label: '⬆️ First', action: 'first' },
-        { label: '➡️', action: 'right' },
-    ];
-
-    actions.forEach(({ label, action }) => {
-        const btn = document.createElement('button');
-        btn.textContent = label;
-        btn.style.cssText = `
-            padding: 6px 10px; background: transparent; border: none;
-            color: #e2e8f0; font-size: 13px; cursor: pointer; border-radius: 6px;
-        `;
-        btn.addEventListener('click', () => {
-            moveWindowTab(windowId, action);
-            menu.remove();
+async function closeWindowById(windowId) {
+    try {
+        const res = await fetchWithAuth('/close-window', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ windowId })
         });
-        menu.appendChild(btn);
-    });
-
-    document.body.appendChild(menu);
-    // Auto-dismiss on tap outside
-    setTimeout(() => {
-        document.addEventListener('click', function dismiss() {
-            menu.remove();
-            document.removeEventListener('click', dismiss);
-        }, { once: true });
-    }, 100);
+        const data = await res.json();
+        if (data.success) {
+            console.log('🗑️ Closed window:', data.projectName);
+            // Remove from local list immediately (optimistic)
+            currentWindows = currentWindows.filter(w => w.id !== windowId);
+            renderWindows();
+            // If the active window changed, refresh
+            if (data.activeWindowId && data.activeWindowId !== currentActiveWindowId) {
+                currentActiveWindowId = data.activeWindowId;
+                renderWindows();
+                loadSnapshot();
+                fetchAppState();
+                checkChatStatus();
+            }
+            // Refresh from server
+            setTimeout(fetchWindows, 2000);
+        } else {
+            console.warn('Close window failed:', data.error);
+        }
+    } catch (e) {
+        console.error('Close window error:', e);
+    }
 }
 
 async function switchWindow(windowId) {
     if (windowId === currentActiveWindowId) return;
 
-    // Save current tabs for the old window
-    if (currentActiveWindowId) {
-        localStorage.setItem('ag_tabs_' + currentActiveWindowId, JSON.stringify(pinnedTabs));
-    }
+    // Close side panel
+    closeSidePanel();
+
+    // Clear old snapshot immediately to prevent stale content flash
+    const chatContent = document.getElementById('chatContent');
+    if (chatContent) chatContent.innerHTML = '<div style="text-align:center;padding:40px;opacity:0.5">Switching window...</div>';
 
     // Optimistic UI update
     currentActiveWindowId = windowId;
+    updateProjectNameBar();
     renderWindows();
+    renderQuickActions(); // Show chips for new project
 
     try {
         const res = await fetchWithAuth('/switch-window', {
@@ -1629,16 +2520,13 @@ async function switchWindow(windowId) {
         if (data.success) {
             console.log('🪟 Switched to:', data.projectName);
 
-            // Load tabs for the new window
-            pinnedTabs = JSON.parse(localStorage.getItem('ag_tabs_' + windowId) || '[]');
-            activeTabTitle = null;
-            renderTabs();
+            // Invalidate workflow cache (different project may have different workflows)
+            cachedWorkflows = null;
 
             // Refresh everything for the new window
             loadSnapshot();
             fetchAppState();
             checkChatStatus();
-            detectCurrentConversation();
         }
     } catch (e) {
         console.error('Window switch failed:', e);
@@ -1683,7 +2571,7 @@ let availableProjects = [];
 
 function updateManagerUI() {
     const isManagerActive = currentWindows.some(w => w.id === currentActiveWindowId && w.isManager);
-    if (isManagerActive && currentWindows.length > 1) {
+    if (isManagerActive) {
         workspaceOpener.style.display = 'block';
         quickActionsBar.style.display = 'none';
         inputSection.style.display = 'none';
@@ -1695,11 +2583,14 @@ function updateManagerUI() {
     }
 }
 
+let projectsBasePath = '';
+
 async function fetchProjectList() {
     try {
         const res = await fetchWithAuth('/list-projects');
         const data = await res.json();
         availableProjects = data.projects || [];
+        projectsBasePath = data.basePath || '';
         renderProjectTiles();
     } catch (e) {
         workspaceProjects.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; padding: 8px;">Could not load projects</div>';
@@ -1732,7 +2623,7 @@ workspaceOpenBtn.addEventListener('click', () => {
     if (!path) return;
     // Auto-prepend base path if just a folder name
     if (!path.includes('\\') && !path.includes('/')) {
-        path = 'C:\\Proyects\\' + path;
+        path = projectsBasePath ? projectsBasePath + '/' + path : path;
     }
     openWorkspace(path);
     workspacePathInput.value = '';
@@ -1743,7 +2634,7 @@ workspacePathInput.addEventListener('keydown', (e) => {
         let path = workspacePathInput.value.trim();
         if (!path) return;
         if (!path.includes('\\') && !path.includes('/')) {
-            path = 'C:\\Proyects\\' + path;
+            path = projectsBasePath ? projectsBasePath + '/' + path : path;
         }
         openWorkspace(path);
         workspacePathInput.value = '';
@@ -1763,7 +2654,8 @@ async function showWorkflowPicker() {
     }
     picker.style.display = 'block';
 
-    if (cachedWorkflows) {
+    // Use cache only if non-empty
+    if (cachedWorkflows && cachedWorkflows.length > 0) {
         renderWorkflowList(cachedWorkflows);
         return;
     }
@@ -1772,8 +2664,11 @@ async function showWorkflowPicker() {
     try {
         const res = await fetchWithAuth('/list-workflows');
         const data = await res.json();
-        cachedWorkflows = data.workflows || [];
-        renderWorkflowList(cachedWorkflows);
+        const workflows = data.workflows || [];
+        if (workflows.length > 0) {
+            cachedWorkflows = workflows;
+        }
+        renderWorkflowList(workflows);
     } catch (e) {
         list.innerHTML = '<div style="color: var(--text-muted); font-size: 12px;">Could not load workflows</div>';
     }
@@ -1805,109 +2700,11 @@ function runWorkflow(name) {
 fetchWindows();
 setInterval(fetchWindows, 30000); // Re-discover every 30s
 
+// Show project tiles when Manager is active (triggered by renderWindows -> updateManagerUI)
 
 
-// ===== TAB MANAGEMENT =====
-let pinnedTabs = JSON.parse(localStorage.getItem('ag_pinned_tabs') || '[]');
-let activeTabTitle = null;
 
-// Clean stale pinned tabs that look like model names (bad data from previous scraping)
-{
-    const MODEL_RE = /^(gemini|claude|gpt|llama|mistral|deepseek|codestral|command|phi|qwen|o[134])\b/i;
-    const before = pinnedTabs.length;
-    pinnedTabs = pinnedTabs.filter(t => !MODEL_RE.test(t.title));
-    if (pinnedTabs.length !== before) {
-        console.log(`🧹 Cleaned ${before - pinnedTabs.length} stale model-name tabs`);
-        localStorage.setItem('ag_pinned_tabs', JSON.stringify(pinnedTabs));
-    }
-}
-function saveTabs() {
-    localStorage.setItem('ag_pinned_tabs', JSON.stringify(pinnedTabs));
-}
-
-function addTab(title) {
-    if (!title) return;
-    // Don't add model names as tabs
-    const MODEL_RE = /^(gemini|claude|gpt|llama|mistral|deepseek|codestral|command|phi|qwen|o[134])\b/i;
-    if (MODEL_RE.test(title)) return;
-    // Don't add duplicates
-    if (pinnedTabs.some(t => t.title === title)) {
-        // Just activate it
-        activeTabTitle = title;
-        renderTabs();
-        return;
-    }
-    pinnedTabs.push({ title });
-    activeTabTitle = title;
-    saveTabs();
-    renderTabs();
-}
-
-function togglePinTab(title) {
-    const idx = pinnedTabs.findIndex(t => t.title === title);
-    if (idx >= 0) {
-        pinnedTabs.splice(idx, 1);
-        if (activeTabTitle === title) activeTabTitle = null;
-    } else {
-        addTab(title);
-        return; // addTab already saves and renders
-    }
-    saveTabs();
-    renderTabs();
-}
-
-function switchTab(title) {
-    if (activeTabTitle === title) return; // Already active
-    activeTabTitle = title;
-    renderTabs();
-    selectChat(title);
-}
-
-function removeTab(title, event) {
-    if (event) { event.stopPropagation(); }
-    pinnedTabs = pinnedTabs.filter(t => t.title !== title);
-    if (activeTabTitle === title) activeTabTitle = null;
-    saveTabs();
-    renderTabs();
-}
-
-function renderTabs() {
-    const tabsBar = document.getElementById('tabsBar');
-    if (!pinnedTabs.length) {
-        tabsBar.innerHTML = '';
-        return;
-    }
-    tabsBar.innerHTML = pinnedTabs.map(tab => {
-        const isActive = tab.title === activeTabTitle;
-        const shortTitle = tab.title.length > 20 ? tab.title.substring(0, 18) + '…' : tab.title;
-        const safeTitle = escapeHtml(tab.title).replace(/'/g, "\\'");
-        return `<div class="tab-chip ${isActive ? 'active' : ''}" onclick="switchTab('${safeTitle}')">
-            <span class="tab-label">${escapeHtml(shortTitle)}</span>
-            <span class="tab-close" onclick="removeTab('${safeTitle}', event)">✕</span>
-        </div>`;
-    }).join('');
-}
-
-// Auto-detect current conversation and add as tab
-async function detectCurrentConversation() {
-    try {
-        const res = await fetchWithAuth('/current-conversation');
-        const data = await res.json();
-        if (data.title) {
-            // Auto-add the current conversation as a tab and mark active
-            addTab(data.title);
-        }
-    } catch (e) {
-        // Silently fail — detection is best-effort
-    }
-}
-
-// Detect on initial load and periodically
-detectCurrentConversation();
-setInterval(detectCurrentConversation, 15000); // Check every 15s
-
-// Render tabs on load
-renderTabs();
+// (Tab management removed — side panel replaces this functionality)
 
 // ===== TERMINAL =====
 const terminalLayer = document.getElementById('terminalLayer');

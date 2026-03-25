@@ -23,8 +23,8 @@
 ### Step 1: Clone & Install
 
 ```bash
-git clone https://github.com/benjibazan/antigravity-phone-connect.git
-cd antigravity-phone-connect
+git clone https://github.com/benjibazan/ag-phone-connect.git
+cd ag-phone-connect
 npm install
 ```
 
